@@ -1,0 +1,10 @@
+numpy
+opencv-python
+streamlit
+streamlit-webrtc
+python-av
+mediapipe
+scikit-learn
+pynput
+pyautogui
+screeninfo
