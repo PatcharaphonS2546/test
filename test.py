@@ -1,22 +1,15 @@
-# test.py
-# 👀 Gaze All-in-One — Single-file build
-# - Calibration วาด/นับบนวิดีโอเฟรม (ไม่รีเฟรชเพจ) + Assist
-# - Progressive points, Stabilizer, Monolid/Unequal-eyes, Eye-first Weighted Ridge
-# - Pointer follow always; click gate unlocks when PASS (RMSE/CV/Uniformity)
-# Requires: streamlit>=1.26, streamlit-webrtc, opencv-python(-headless), mediapipe, av, numpy
-# Optional (for real mouse control): pyautogui
+# test3.py — One-file, layered architecture with contracts, FSM, and full metrics/logging
+# Run: streamlit run test3.py
 
-import math, time, threading, queue, json, pathlib, os, random
+from __future__ import annotations
+import os, math, time, threading, queue, json, pathlib, typing as T
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
 import numpy as np
 import streamlit as st
 
-# Optional deps guard
-try:
-    import cv2
-except Exception:
-    cv2 = None
+# --- Optional deps
+try: import cv2
+except Exception: cv2 = None
 try:
     import mediapipe as mp
 except Exception:
@@ -25,1203 +18,847 @@ try:
     import pyautogui
 except Exception:
     pyautogui = None
+try:
+    import pandas as pd
+except Exception:
+    pd = None
 
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
 from av import VideoFrame
 
-# ----------------------------- Utils -----------------------------
-def _safe_size():
-    if pyautogui:
-        try:
-            return pyautogui.size()
-        except Exception:
-            pass
-    return 1920, 1080
-
-# ----------------------------- Mouse Controller -----------------------------
-class MouseController:
-    """
-    - เคลื่อนเมาส์ต่อเนื่อง (rate-limited) เมื่อ enable=True
-    - คลิกแบบ dwell เฉพาะเมื่อ do_click=True (ปล่อยให้ gate ควบคุม)
-    """
-    def __init__(self, enable: bool = False, dwell_ms: int = 700, dwell_radius_px: int = 40):
-        self.sw, self.sh = _safe_size()
-        self.enabled = enable
-        self.dwell_ms = dwell_ms
-        self.dwell_radius_px = dwell_radius_px
-        self._last_in_time = None
-        self._last_target = None
-        self.move_rate_limit_ms = 33  # ~30 FPS
-        self._last_move_at = 0.0
-
-    def set_enable(self, v: bool):
-        self.enabled = v
-        if not v:
-            self._last_in_time = None
-            self._last_target = None
-
-    def _click_here(self):
-        if pyautogui is not None:
-            try:
-                pyautogui.click()
-            except Exception:
-                pass
-
-    def update(self, x_norm: float, y_norm: float, do_click: bool = True):
-        if not self.enabled:
-            self._last_in_time = None
-            return
-
-        x_px = int(x_norm * self.sw)
-        y_px = int(y_norm * self.sh)
-
-        # move pointer (rate-limited)
-        now = time.time()
-        if (now - self._last_move_at) * 1000.0 >= self.move_rate_limit_ms:
-            if pyautogui is not None:
-                try:
-                    pyautogui.moveTo(x_px, y_px)
-                except Exception:
-                    pass
-            self._last_move_at = now
-
-        # dwell detection
-        tgt = (x_px, y_px)
-        if self._last_target is None or math.hypot(tgt[0] - self._last_target[0], tgt[1] - self._last_target[1]) > self.dwell_radius_px:
-            self._last_target = tgt
-            self._last_in_time = time.time()
-            return
-
-        if do_click and self._last_in_time is not None:
-            if (time.time() - self._last_in_time) * 1000.0 >= self.dwell_ms:
-                self._click_here()
-                self._last_in_time = None
-
-# ----------------------------- One Euro Filter -----------------------------
-class OneEuroFilter:
-    def __init__(self, freq=120.0, mincutoff=1.0, beta=0.01, dcutoff=1.0):
-        self.freq = freq; self.mincutoff = float(mincutoff); self.beta = float(beta); self.dcutoff = float(dcutoff)
-        self.x_prev = None; self.dx_prev = 0.0; self.t_prev = None
-
-    def alpha(self, cutoff):
-        te = 1.0 / max(1e-6, self.freq)
-        tau = 1.0 / (2 * math.pi * cutoff)
-        return 1.0 / (1.0 + tau / te)
-
-    def filter(self, x, t=None):
-        if self.t_prev is None:
-            self.t_prev = time.time() if t is None else t
-            self.x_prev = x
-            return x
-        tnow = time.time() if t is None else t
-        dt = max(1e-6, tnow - self.t_prev)
-        self.freq = 1.0 / dt
-        self.t_prev = tnow
-        dx = (x - self.x_prev) * self.freq
-        a_d = self.alpha(self.dcutoff)
-        dx_hat = a_d * dx + (1 - a_d) * self.dx_prev
-        cutoff = self.mincutoff + self.beta * abs(dx_hat)
-        a = self.alpha(cutoff)
-        x_hat = a * x + (1 - a) * self.x_prev
-        self.x_prev = x_hat
-        self.dx_prev = dx_hat
-        return x_hat
-
-# ----------------------------- Config & Session -----------------------------
+# ========================= Contracts (dataclasses) =========================
 @dataclass
-class GazeConfig:
-    screen_w: int = _safe_size()[0]
-    screen_h: int = _safe_size()[1]
-    gain: float = 1.0
-    gain_x: float = 1.0
-    gain_y: float = 1.0
-    gamma: float = 1.0
-    deadzone: float = 0.02
-    fallback_kx: float = 1.6
-    fallback_ky: float = 1.4
+class Features:
+    eye_cx_norm: float
+    eye_cy_norm: float
+    face_cx_norm: float
+    face_cy_norm: float
+    eye_open: bool
+    quality: float
 
-# ---- Report + Gate thresholds ----
+@dataclass
+class GazePoint:
+    x: float
+    y: float
+
+@dataclass
+class Metrics:
+    fps: float
+    latency_ms: float
+    model: str
+
 @dataclass
 class CalibrationReport:
     n_points: int
-    rmse_px: Optional[float]
-    rmse_cv_px: Optional[float]
-    uniformity: float   # 0..1 convex hull area on normalized screen
+    rmse_px: float | None
+    rmse_cv_px: float | None
+    mae_px: float | None
+    rmse_norm: float | None
+    mae_norm: float | None
+    uniformity: float
     width: int
     height: int
-    def passed(self) -> bool:
-        if self.n_points < 9: return False
-        if self.uniformity < 0.55: return False
+    def passed(self, min_points=9, umin=0.55, rmse_px_max=30, rmse_cv_max=35) -> bool:
+        if self.n_points < min_points: return False
+        if self.uniformity < umin: return False
         if self.rmse_px is None or self.rmse_cv_px is None: return False
-        return (self.rmse_px <= 30.0 and self.rmse_cv_px <= 35.0)
+        return (self.rmse_px <= rmse_px_max and self.rmse_cv_px <= rmse_cv_max)
 
-class SessionState:
+# ========================= Utils =========================
+def _safe_size() -> tuple[int, int]:
+    if pyautogui:
+        try: return pyautogui.size()
+        except Exception: pass
+    return 1920, 1080
+
+def _now_iso() -> str:
+    import datetime as dt
+    return dt.datetime.now().isoformat(timespec="seconds")
+
+# High-resolution timer
+def _now_perf() -> float:
+    return time.perf_counter()
+
+# ========================= Filters / Controllers =========================
+class OneEuro:
+    def __init__(self, freq=120.0, mincutoff=1.0, beta=0.01, dcutoff=1.0):
+        self.freq=freq; self.mincutoff=mincutoff; self.beta=beta; self.dcutoff=dcutoff
+        self.x_prev=None; self.dx_prev=0.0; self.t_prev=None
+    def _alpha(self, cutoff):
+        te = 1.0/max(1e-6,self.freq); tau=1.0/(2*math.pi*cutoff)
+        return 1.0/(1.0+tau/te)
+    def filter(self, x, t=None):
+        tnow=_now_perf() if t is None else t
+        if self.t_prev is None: self.t_prev=tnow; self.x_prev=x; return x
+        dt=max(1e-6,tnow-self.t_prev); self.freq=1.0/dt; self.t_prev=tnow
+        dx=(x-self.x_prev)*self.freq
+        a_d=self._alpha(self.dcutoff)
+        dxh=a_d*dx + (1-a_d)*self.dx_prev
+        cutoff=self.mincutoff + self.beta*abs(dxh)
+        a=self._alpha(cutoff)
+        xh=a*x+(1-a)*self.x_prev
+        self.x_prev=xh; self.dx_prev=dxh
+        return xh
+
+class MouseController:
+    def __init__(self, enable=False, dwell_ms=700, dwell_radius_px=40):
+        self.sw,self.sh=_safe_size()
+        self.enabled=enable
+        self.dwell_ms=dwell_ms
+        self.dwell_radius_px=dwell_radius_px
+        self._last_in=None; self._last_tgt=None
+        self._last_move=_now_perf()
+    def set_enable(self, v: bool):
+        self.enabled=v
+        if not v: self._last_in=None; self._last_tgt=None
+    def update(self, x_norm: float, y_norm: float, do_click=True):
+        if not self.enabled: self._last_in=None; return
+        x_px=int(x_norm*self.sw); y_px=int(y_norm*self.sh)
+        now=_now_perf()
+        if (now-self._last_move)*1000.0>=33:
+            if pyautogui is not None:
+                try: pyautogui.moveTo(x_px,y_px)
+                except Exception: pass
+            self._last_move=now
+        tgt=(x_px,y_px)
+        if (self._last_tgt is None) or (math.hypot(tgt[0]-(self._last_tgt[0] if self._last_tgt else 0), tgt[1]-(self._last_tgt[1] if self._last_tgt else 0))>self.dwell_radius_px):
+            self._last_tgt=tgt; self._last_in=_now_perf(); return
+        if do_click and self._last_in is not None:
+            if (_now_perf()-self._last_in)*1000.0>=self.dwell_ms:
+                if pyautogui is not None:
+                    try: pyautogui.click()
+                    except Exception: pass
+                self._last_in=None
+
+# ========================= Trackers / Extractors =========================
+class Kalman2D:
+    def __init__(self, x0, y0, vx0=0.0, vy0=0.0):
+        self.x=np.array([[x0],[y0],[vx0],[vy0]],dtype=np.float32)
+        self.P=np.eye(4,dtype=np.float32)*100.0
+        self.Q=np.diag([1e-2,1e-2,5e-1,5e-1]).astype(np.float32)
+        self.R=np.diag([3.0,3.0]).astype(np.float32)
+    def predict(self, dt):
+        F=np.array([[1,0,dt,0],[0,1,0,dt],[0,0,1,0],[0,0,0,1]],dtype=np.float32)
+        self.x=F@self.x; self.P=F@self.P@F.T + self.Q
+    def update(self, zx, zy, mscale=1.0):
+        H=np.array([[1,0,0,0],[0,1,0,0]],dtype=np.float32)
+        z=np.array([[zx],[zy]],dtype=np.float32)
+        R=self.R*(mscale**2)
+        y=z-H@self.x; S=H@self.P@H.T + R; K=self.P@H.T@np.linalg.inv(S)
+        self.x=self.x + K@y; self.P=(np.eye(4,dtype=np.float32)-K@H)@self.P
+    def state(self): return float(self.x[0,0]), float(self.x[1,0])
+
+class IrisTracker:
+    """หา iris center แบบไม่พึ่งโมเดลหนัก ใช้ threshold/contour + Hough + Kalman"""
     def __init__(self):
-        self.smooth_x = OneEuroFilter(120, 1.0, 0.01, 1.0)
-        self.smooth_y = OneEuroFilter(120, 1.0, 0.01, 1.0)
-        self.calib_X: List[List[float]] = []
-        self.calib_yx: List[float] = []
-        self.calib_yy: List[float] = []
-        self.calib_w: List[float] = []      # NEW: sample weight ต่อจุดคาลิเบรท
-        self.model_ready = False
-        self.model_pipeline = None          # (pipe_x, pipe_y) หรือ (wx, wy)
-        self.last_feat: Optional[np.ndarray] = None
-        self.last_quality: float = 0.5      # NEW: quality ล่าสุดจาก extractor
-        self.t_prev = None
-        self.fps_hist: List[float] = []
-        # Drift
-        self.drift_enabled = False
-        self.drift_dx = 0.0
-        self.drift_dy = 0.0
-        self.drift_alpha = 0.15
-        # Cached report
-        self.calib_report: Optional[CalibrationReport] = None
-
-try:
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import PolynomialFeatures
-    from sklearn.linear_model import Ridge
-except Exception:
-    Pipeline = PolynomialFeatures = Ridge = None
-
-# ----------------------------- Feature Vector -----------------------------
-def _feat_vec(feat: dict) -> np.ndarray:
-    # ลดน้ำหนักฟีเจอร์ใบหน้า (fx, fy) ตั้งแต่ต้นทาง เพื่อลดการยึดหัว
-    ex = float(feat.get('eye_cx_norm', 0.5))
-    ey = float(feat.get('eye_cy_norm', 0.5))
-    fx = float(feat.get('face_cx_norm', 0.5))
-    fy = float(feat.get('face_cy_norm', 0.5))
-    fx = 0.5 + (fx - 0.5) * 0.3
-    fy = 0.5 + (fy - 0.5) * 0.3
-    return np.array([ex, ey, fx, fy, 1.0], dtype=np.float32)
-
-def _poly_expand(X: np.ndarray) -> np.ndarray:
-    if X.ndim == 1:
-        X = X[None, :]
-    cols = [X]; n = X.shape[1]
-    for i in range(n):
-        for j in range(i, n):
-            cols.append((X[:, i] * X[:, j])[:, None])
-    return np.concatenate(cols, axis=1)
-
-# ---- Penalty & Weighted Ridge helpers ----
-def _build_penalty_vector(n_base: int = 5,
-                          eye_pen: float = 0.1,
-                          face_pen: float = 8.0,
-                          bias_pen: float = 0.5) -> np.ndarray:
-    """
-    คืน penalty ต่อคอลัมน์ของ Phi (poly degree=2)
-    base features index: 0=ex, 1=ey, 2=fx, 3=fy, 4=const(1)
-    - เทอมที่มี fx/fy → ลงโทษหนัก (ลดการพึ่งหัว)
-    - เทอมที่มี ex/ey อย่างเดียว → เบา (ให้พึ่งตา)
-    """
-    n = n_base
-    base_pen = [eye_pen, eye_pen, face_pen, face_pen, bias_pen]
-    pens = list(base_pen)
-    for i in range(n):
-        for j in range(i, n):
-            pens.append(max(base_pen[i], base_pen[j]))
-    return np.array(pens, dtype=np.float32)
-
-def _fit_weighted_ridge(Phi: np.ndarray, y: np.ndarray,
-                        sample_w: np.ndarray, pen_vec: np.ndarray, lam: float) -> np.ndarray:
-    """
-    แก้ (Phi^T W Phi + lam * diag(pen_vec)) w = Phi^T W y
-    โดย W = diag(sample_w)
-    """
-    sw = np.sqrt(np.clip(sample_w.reshape(-1, 1), 0.0, 1e6))
-    Phi_w = Phi * sw
-    y_w = y.reshape(-1, 1) * sw
-    A = Phi_w.T @ Phi_w + lam * np.diag(pen_vec.astype(np.float64))
-    b = Phi_w.T @ y_w
-    w = np.linalg.solve(A, b)  # (D x 1)
-    return w.reshape(-1)
-
-# ---- Accuracy helpers ----
-def _rmse_px(pred_xy: np.ndarray, true_xy: np.ndarray, W: int, H: int) -> float:
-    dx = (pred_xy[:, 0] - true_xy[:, 0]) * W
-    dy = (pred_xy[:, 1] - true_xy[:, 1]) * H
-    return float(np.sqrt(np.mean(dx*dx + dy*dy)))
-
-def _uniformity_score(points_xy_norm: np.ndarray) -> float:
-    pts = np.asarray(points_xy_norm, float)
-    if len(pts) < 3: return 0.0
-    pts = pts[np.lexsort((pts[:,1], pts[:,0]))]
-    def cross(o,a,b): return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
-    lower=[]
-    for p in pts:
-        while len(lower)>=2 and cross(lower[-2], lower[-1], p) <= 0: lower.pop()
-        lower.append(p)
-    upper=[]
-    for p in pts[::-1]:
-        while len(upper)>=2 and cross(upper[-2], upper[-1], p) <= 0: upper.pop()
-        upper.append(p)
-    hull = np.vstack([lower[:-1], upper[:-1]])
-    area = 0.0
-    for i in range(len(hull)):
-        x1,y1 = hull[i]; x2,y2 = hull[(i+1)%len(hull)]
-        area += x1*y2 - x2*y1
-    area = abs(area)/2.0
-    return float(max(0.0, min(1.0, area)))
-
-# ----------------------------- MediaPipe FeatureExtractor -----------------------------
-class FeatureExtractor:
-    # ใช้ Mediapipe FaceMesh + Iris (รองรับ monolid/unequal-eyes ด้วย per-eye weighting)
-    LEFT_EYE_IDS = [33, 133, 159, 145]
-    RIGHT_EYE_IDS = [362, 263, 386, 374]
-    LEFT_IRIS_IDS = [468, 469, 470, 471, 472]
-    RIGHT_IRIS_IDS = [473, 474, 475, 476, 477] if mp is not None else [468, 469, 470, 471, 472]
-
-    def __init__(self, use_mediapipe: bool = True):
-        self.use_mediapipe = use_mediapipe and (mp is not None) and (cv2 is not None)
-        if self.use_mediapipe:
-            self.mp_face = mp.solutions.face_mesh
-            self.mesh = self.mp_face.FaceMesh(
-                static_image_mode=False, refine_landmarks=True, max_num_faces=1,
-                min_detection_confidence=0.5, min_tracking_confidence=0.5
-            )
+        self.kf: Kalman2D | None = None
+        self.last_t = _now_perf()
+        self.roi = 180
+        self.cxcy = None
+        self.det_hist: list[tuple[float,int]] = []
+    @staticmethod
+    def _crop_aspect(img, w=640, h=480):
+        if img is None: return None
+        H,W=img.shape[:2]; desired=w/h; cur=W/H
+        if cur>desired:
+            newW=int(desired*H); off=(W-newW)//2; img=img[:,off:off+newW]
         else:
-            self.mesh = None
-
-        # Adaptive baseline EAR ต่อข้าง (EMA)
-        self.earL_base = None
-        self.earR_base = None
-        self._ema_alpha = 0.05
-
-    def close(self):
-        if self.mesh is not None:
-            self.mesh.close()
-
-    @staticmethod
-    def _avg_xy(ids, pts):
-        xs = [pts[i][0] for i in ids if i < len(pts)]
-        ys = [pts[i][1] for i in ids if i < len(pts)]
-        if not xs or not ys:
-            return None
-        return (sum(xs)/len(xs), sum(ys)/len(ys))
-
-    @staticmethod
-    def _eye_box_metrics(ids, pts):
-        # คืน (x0,x1,y0,y1,w,h,EAR_simple)
-        xs = [pts[i][0] for i in ids if i < len(pts)]
-        ys = [pts[i][1] for i in ids if i < len(pts)]
-        if not xs or not ys:
-            return None
-        x0, x1 = min(xs), max(xs); y0, y1 = min(ys), max(ys)
-        w = max(6.0, x1 - x0); h = max(2.0, y1 - y0)
-        ear = h / max(6.0, w)  # EAR อย่างง่าย
-        return (x0, x1, y0, y1, w, h, ear)
-
-    @staticmethod
-    def _norm_in_box(p, box):
-        if p is None or box is None:
-            return (0.5, 0.5)
-        x0, x1, y0, y1, w, h, _ = box
-        nx = (p[0] - x0) / w; ny = (p[1] - y0) / h
-        return (min(1.0, max(0.0, nx)), min(1.0, max(0.0, ny)))
-
-    def _extract_mediapipe(self, frame_bgr) -> Optional[dict]:
-        h, w = frame_bgr.shape[:2]
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        res = self.mesh.process(frame_rgb)
-        if not res.multi_face_landmarks:
-            return None
-
-        lm = res.multi_face_landmarks[0]
-        pts = [(lm.landmark[i].x * w, lm.landmark[i].y * h, lm.landmark[i].z) for i in range(len(lm.landmark))]
-
-        # iris center ต่อข้าง
-        l_iris = self._avg_xy(self.LEFT_IRIS_IDS, pts)
-        r_iris = self._avg_xy(self.RIGHT_IRIS_IDS, pts)
-        if l_iris is None and r_iris is None:
-            return None
-
-        # กรอบตา + EAR
-        L_EYE = self.LEFT_EYE_IDS; R_EYE = self.RIGHT_EYE_IDS
-        l_box = self._eye_box_metrics(L_EYE, pts)
-        r_box = self._eye_box_metrics(R_EYE, pts)
-
-        l_n = self._norm_in_box(l_iris, l_box) if l_iris is not None else (0.5, 0.5)
-        r_n = self._norm_in_box(r_iris, r_box) if r_iris is not None else (0.5, 0.5)
-
-        # EAR baseline ด้วย EMA
-        def _upd_base(cur, base):
-            if cur is None:
-                return base
-            return cur if base is None else (base*(1.0-self._ema_alpha) + cur*self._ema_alpha)
-
-        earL = l_box[6] if l_box is not None else None
-        earR = r_box[6] if r_box is not None else None
-        if earL is not None and earL > 0.18:
-            self.earL_base = _upd_base(earL, self.earL_base)
-        if earR is not None and earR > 0.18:
-            self.earR_base = _upd_base(earR, self.earR_base)
-
-        # per-eye confidence (0..1)
-        def _eye_conf(ear, base, box, iris_ok):
-            if (ear is None) or (box is None) or (not iris_ok):
-                return 0.0
-            ratio = (ear / 0.26) if base is None else (ear / max(1e-6, 0.8*base))
-            ratio = max(0.0, min(1.4, ratio))
-            _, _, _, _, bw, bh, _ = box
-            area_norm = (bw*bh) / (w*h)
-            area_boost = min(1.0, area_norm / 0.02)
-            conf = (0.7*ratio) + (0.3*area_boost)
-            return max(0.0, min(1.0, conf))
-
-        cL = _eye_conf(earL, self.earL_base, l_box, l_iris is not None)
-        cR = _eye_conf(earR, self.earR_base, r_box, r_iris is not None)
-
-        eye_open = bool((earL or 0.0) > 0.20 or (earR or 0.0) > 0.20)
-
-        # รวมศูนย์กลางม่านตาแบบถ่วงน้ำหนัก
-        wL, wR = cL, cR
-        if (wL + wR) < 1e-3:
-            eye_cx_norm = 0.5; eye_cy_norm = 0.5
-        else:
-            eye_cx_norm = float((l_n[0]*wL + r_n[0]*wR) / (wL + wR))
-            eye_cy_norm = float((l_n[1]*wL + r_n[1]*wR) / (wL + wR))
-
-        # face center (ชดเชย head translation)
-        face_ids = [1, 9, 152, 33, 263]
-        fxs = [pts[i][0] for i in face_ids if i < len(pts)]
-        fys = [pts[i][1] for i in face_ids if i < len(pts)]
-        face_cx_norm = float(sum(fxs)/len(fxs) / max(1, w)) if fxs else 0.5
-        face_cy_norm = float(sum(fys)/len(fys) / max(1, h)) if fys else 0.5
-
-        # overall quality
-        box_margin = min(eye_cx_norm, 1-eye_cx_norm, eye_cy_norm, 1-eye_cy_norm)
-        quality = max(cL, cR) * (0.6 + 0.4*max(0.0, min(1.0, box_margin*2)))
-
-        return {
-            "eye_cx_norm": eye_cx_norm, "eye_cy_norm": eye_cy_norm,
-            "face_cx_norm": face_cx_norm, "face_cy_norm": face_cy_norm,
-            "eye_open": eye_open, "quality": float(quality),
-            "eye_conf_L": float(cL), "eye_conf_R": float(cR),
-            "earL": float(earL or 0.0), "earR": float(earR or 0.0),
-            "earL_base": float(self.earL_base or 0.0), "earR_base": float(self.earR_base or 0.0),
-        }
-
-    def extract(self, frame_bgr) -> Optional[dict]:
-        if frame_bgr is None:
-            return None
-        if self.use_mediapipe and self.mesh is not None:
+            newH=int(W/desired); off=(H-newH)//2; img=img[off:off+newH,:]
+        return cv2.resize(img,(w,h)) if cv2 is not None else img
+    def detect(self, frame_bgr) -> tuple[float,float] | None:
+        if cv2 is None or frame_bgr is None: return None
+        img=self._crop_aspect(frame_bgr); h,w=img.shape[:2]
+        if self.cxcy is None: self.cxcy=(w//2, h//2)
+        cx,cy=self.cxcy; roi=int(max(80,min(320,self.roi)))
+        x0=max(0,cx-roi//2); y0=max(0,cy-roi//2); x1=min(w,x0+roi); y1=min(h,y0+roi)
+        x0=max(0,min(x0,w-(x1-x0))); y0=max(0,min(y0,h-(y1-y0))); x1=min(w,x0+roi); y1=min(h,y0+roi)
+        roi_img=img[y0:y1,x0:x1]
+        if roi_img.size==0: roi_img=img; x0=y0=0; x1=w; y1=h
+        g=cv2.cvtColor(roi_img,cv2.COLOR_BGR2GRAY)
+        try:
+            g=cv2.createCLAHE(2.0,(8,8)).apply(g)
+        except Exception: pass
+        g=cv2.GaussianBlur(g,(5,5),0)
+        gx=cv2.Sobel(g,cv2.CV_32F,1,0,ksize=3)
+        gy=cv2.Sobel(g,cv2.CV_32F,0,1,ksize=3)
+        gmag=cv2.magnitude(gx,gy)
+        hi=float(np.percentile(g,96)); med=float(np.median(g)); mask=g>hi
+        if np.any(mask):
+            g=g.copy(); g[mask]=int(med)
+        # threshold
+        thr=int(min(255,max(0,20+8)))
+        _,th=cv2.threshold(g,thr,255,cv2.THRESH_BINARY_INV)
+        th=cv2.morphologyEx(th,cv2.MORPH_OPEN,np.ones((3,3),np.uint8),1)
+        th=cv2.morphologyEx(th,cv2.MORPH_CLOSE,np.ones((5,5),np.uint8),1)
+        cnts,_=cv2.findContours(th,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        best=None; bscore=-1.0
+        for c in cnts:
+            area=cv2.contourArea(c)
+            if area<300 or area>(roi*roi*0.55): continue
+            if len(c)>=5:
+                (cx_r,cy_r),(MA,ma),_ = cv2.fitEllipse(c)
+                if ma<1: continue
+                ratio=max(MA,ma)/max(1e-6,min(MA,ma))
+                if ratio>3.5: continue
+                per=cv2.arcLength(c,True); circ=4*math.pi*area/(per*per+1e-6)
+                gc=[]
+                for i in range(0,len(c),5):
+                    px,py=int(c[i,0,0]),int(c[i,0,1])
+                    if 1<=px<g.shape[1]-1 and 1<=py<g.shape[0]-1:
+                        gxv=float(gx[py,px]); gyv=float(gy[py,px]); mag=float(gmag[py,px])+1e-6
+                        rx=float(cx_r)-px; ry=float(cy_r)-py; rmag=math.hypot(rx,ry)+1e-6
+                        cos=(( -gxv)*rx + (-gyv)*ry)/(mag*rmag)
+                        gc.append(max(0.0,min(1.0,(cos+1.0)/2.0)))
+                gcons=float(np.mean(gc)) if gc else 0.5
+                if gcons<0.35: continue
+                score=area*circ*(0.5+0.5*gcons)
+                if score>bscore: bscore=score; best=(int(cx_r),int(cy_r))
+        used_darkest=False
+        if best is None:
             try:
-                return self._extract_mediapipe(frame_bgr)
-            except Exception:
-                return None
-        # fallback (ไม่มี mediapipe)
-        return {"eye_cx_norm":0.5,"eye_cy_norm":0.5,"face_cx_norm":0.5,"face_cy_norm":0.5,
-                "eye_open":True,"quality":0.2,"eye_conf_L":0.1,"eye_conf_R":0.1,
-                "earL":0.2,"earR":0.2,"earL_base":0.2,"earR_base":0.2}
-
-# ----------------------------- ESP32 Reader -----------------------------
-def _crop_to_aspect_ratio(image, width=640, height=480):
-    h, w = image.shape[:2]; desired = width/height; cur = w/h
-    if cur > desired:
-        new_w = int(desired * h); off = (w - new_w) // 2; image = image[:, off:off+new_w]
-    else:
-        new_h = int(w/desired); off = (h - new_h)//2; image = image[off:off+new_h, :]
-    return cv2.resize(image, (width, height)) if cv2 is not None else image
-
-def _get_darkest_area(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    ignore = 20; step = 10; win = 20
-    best_sum, best_pt = 1e18, None
-    for y in range(ignore, gray.shape[0] - ignore, step):
-        for x in range(ignore, gray.shape[1] - ignore, step):
-            tile = gray[y:y+win, x:x+win]; s = float(tile.sum())
-            if s < best_sum: best_sum, best_pt = s, (x + win//2, y + win//2)
-    return best_pt
-
-def _iris_center_norm_from_frame(frame_bgr):
-    if cv2 is None: return None
-    frame = _crop_to_aspect_ratio(frame_bgr, 640, 480)
-    h, w = frame.shape[:2]
-    pt = _get_darkest_area(frame) or (w//2, h//2)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    darkest = int(gray[pt[1], pt[0]])
-    _, th = cv2.threshold(gray, darkest + 12, 255, cv2.THRESH_BINARY_INV)
-    mask = np.zeros_like(th); size = 250; x, y = pt; hs = size // 2
-    mask[max(0,y-hs):min(h,y+hs), max(0,x-hs):min(w,x+hs)] = 255
-    th = cv2.bitwise_and(th, mask)
-    th = cv2.dilate(th, np.ones((5,5), np.uint8), iterations=2)
-    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = [c for c in cnts if cv2.contourArea(c) >= 1000]
-    if not cnts: return None
-    c = max(cnts, key=cv2.contourArea)
-    if len(c) < 5: return None
-    (cx, cy), (a, b), _ = cv2.fitEllipse(c)
-    if max(a,b)/max(1e-6, min(a,b)) > 3.0: return None
-    nx = float(cx) / float(w); ny = float(cy) / float(h)
-    return (min(1.0, max(0.0, nx)), min(1.0, max(0.0, ny)))
+                circles=cv2.HoughCircles(g,cv2.HOUGH_GRADIENT,dp=1.5,minDist=30,param1=60,param2=18,minRadius=8,maxRadius=int(roi*0.45))
+                if circles is not None and len(circles[0])>0:
+                    c0=circles[0][0]; best=(int(c0[0]),int(c0[1]))
+            except Exception: pass
+        if best is None:
+            # fallback darkest window
+            gf=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+            step,win=10,20; best_sum=1e18; bx=by=None
+            for yy in range(y0,y1-win,step):
+                for xx in range(x0,x1-win,step):
+                    s=float(gf[yy:yy+win,xx:xx+win].sum())
+                    if s<best_sum: best_sum=s; bx=xx+win//2; by=yy+win//2
+            if bx is None: return None
+            cx,cy=bx,by; used_darkest=True
+        else:
+            cx,cy=x0+best[0], y0+best[1]
+        # Kalman
+        now=_now_perf(); dt=max(1e-3, now-self.last_t); self.last_t=now
+        if self.kf is None: self.kf=Kalman2D(cx,cy)
+        self.kf.predict(dt)
+        conf = 0.25 if used_darkest else float(min(1.0,max(0.0, bscore/(roi*roi*5.0)))) if bscore>0 else 0.25
+        mscale = 2.5 if used_darkest else float(np.interp(conf,[0.25,0.6,0.9],[1.8,1.0,0.7]))
+        self.kf.update(cx,cy,mscale)
+        cx_kf,cy_kf=self.kf.state()
+        self.cxcy=(int(cx_kf),int(cy_kf))
+        # adapt ROI
+        if conf<0.45 or used_darkest: self.roi=min(320,int(self.roi*1.12+6))
+        elif conf>0.65: self.roi=max(120,int(self.roi*0.92))
+        # output normalized
+        nx=float(self.cxcy[0])/float(w); ny=float(self.cxcy[1])/float(h)
+        return (min(1.0,max(0.0,nx)), min(1.0,max(0.0,ny)))
 
 class ESP32Reader(threading.Thread):
-    def __init__(self, url: str, out_q: queue.Queue, stop_event: threading.Event):
-        super().__init__(daemon=True); self.url = url; self.out_q = out_q; self.stop_event = stop_event
+    """อ่านสตรีม MJPEG ของ ESP32cam ผ่าน OpenCV แล้วส่ง Features เข้า Queue"""
+    def __init__(self, url: str, out_q: "queue.Queue[Features]", stop_event: threading.Event, iris: IrisTracker):
+        super().__init__(daemon=True)
+        self.url = url
+        self.q = out_q
+        self.stop = stop_event
+        self.iris = iris
+
     def run(self):
-        if cv2 is None: return
-        while not self.stop_event.is_set():
+        if cv2 is None:
+            return
+        while not self.stop.is_set():
             cap = None
             try:
                 cap = cv2.VideoCapture(self.url)
-                try: cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                except Exception: pass
-                if not cap.isOpened(): time.sleep(1.0); continue
-                for _ in range(3): cap.grab()
-                last_ok = time.time()
-                while not self.stop_event.is_set():
-                    for _ in range(2): cap.grab()
-                    ok, frame = cap.read()
-                    if not ok or frame is None: break
-                    last_ok = time.time()
-                    res = _iris_center_norm_from_frame(frame)
-                    if res is not None:
-                        nx, ny = res
-                        try: self.out_q.put((nx, ny), timeout=0.005)
-                        except Exception: pass
-                    if (time.time() - last_ok) > 3.0: break
-            except Exception:
-                time.sleep(1.0)
-            finally:
-                if cap is not None: cap.release()
-
-# ----------------------------- Gaze Engine -----------------------------
-def _make_model():
-    if Pipeline and PolynomialFeatures and Ridge:
-        return (
-            Pipeline([('poly', PolynomialFeatures(degree=2, include_bias=True)), ('reg', Ridge(alpha=1.0))]),
-            Pipeline([('poly', PolynomialFeatures(degree=2, include_bias=True)), ('reg', Ridge(alpha=1.0))])
-        )
-    else:
-        return ("manual_poly_ridge", "manual_poly_ridge")
-
-def _fit_model_dispatch(model_tuple, X: np.ndarray, Y: np.ndarray):
-    # Y: Nx2 normalized
-    if isinstance(model_tuple[0], str):
-        Phi = _poly_expand(X); lam = 1e-3
-        A = Phi.T @ Phi + lam * np.eye(Phi.shape[1])
-        bx = Phi.T @ Y[:,0]; by = Phi.T @ Y[:,1]
-        wx = np.linalg.solve(A, bx); wy = np.linalg.solve(A, by)
-        return (wx, wy)
-    else:
-        pipe_x, pipe_y = model_tuple
-        pipe_x = pipe_x.fit(X, Y[:,0])
-        pipe_y = pipe_y.fit(X, Y[:,1])
-        return (pipe_x, pipe_y)
-
-def _predict_dispatch(fitted_tuple, X: np.ndarray) -> np.ndarray:
-    if isinstance(fitted_tuple[0], np.ndarray) or isinstance(fitted_tuple[0], list):
-        wx, wy = fitted_tuple
-        Phi = _poly_expand(X)
-        x = Phi @ wx; y = Phi @ wy
-        return np.stack([x, y], axis=1).astype(np.float32)
-    if isinstance(fitted_tuple[0], str):  # shouldn't happen
-        raise RuntimeError("Model not fitted")
-    pipe_x, pipe_y = fitted_tuple
-    x = pipe_x.predict(X); y = pipe_y.predict(X)
-    return np.stack([x, y], axis=1).astype(np.float32)
-
-class GazeEngine:
-    def __init__(self, cfg: GazeConfig, extractor: FeatureExtractor):
-        self.cfg = cfg; self.ext = extractor; self.sess = SessionState()
-
-    def update_config(self, **kwargs):
-        for k, v in kwargs.items():
-            if hasattr(self.cfg, k): setattr(self.cfg, k, v)
-
-    # ---- Stability layer (reject outliers / clamp velocity / freeze on low quality) ----
-    def _stabilize(self, x: float, y: float, quality: float, eye_open: bool) -> Tuple[float, float]:
-        if not hasattr(self, "_stab_last"):
-            self._stab_last = (0.5, 0.5)
-            self._stab_hist = []
-            self._stab_last_t = time.time()
-
-        last_x, last_y = self._stab_last
-        now = time.time()
-        dt = max(1e-3, now - self._stab_last_t)
-
-        # 1) freeze เมื่อคุณภาพต่ำ/หลับตา
-        if (not eye_open) or (quality < 0.25):
-            return last_x, last_y
-
-        # 2) median guard
-        self._stab_hist.append((x, y))
-        if len(self._stab_hist) > 5: self._stab_hist = self._stab_hist[-5:]
-        medx = float(np.median([p[0] for p in self._stab_hist]))
-        medy = float(np.median([p[1] for p in self._stab_hist]))
-        thr = 0.10 - 0.05 * quality   # 0.10..0.05
-        if math.hypot(x - medx, y - medy) > thr:
-            x, y = medx, medy
-
-        # 3) velocity clamp
-        max_step = (0.08 + 0.06 * (1.0 - quality)) * dt * 60.0  # ต่อเฟรม อิง 60fps
-        dx, dy = x - last_x, y - last_y
-        dist = math.hypot(dx, dy)
-        if dist > max_step:
-            scale = max_step / max(1e-6, dist)
-            x = last_x + dx * scale
-            y = last_y + dy * scale
-
-        self._stab_last = (x, y); self._stab_last_t = now
-        return x, y
-
-    # Calibration (เก็บจุด + sample weight)
-    def calibration_add_point(self, screen_x_norm: float, screen_y_norm: float):
-        if self.sess.last_feat is None: 
-            return False
-        x = self.sess.last_feat.astype(np.float32)
-        self.sess.calib_X.append(x.tolist())
-        self.sess.calib_yx.append(float(screen_x_norm))
-        self.sess.calib_yy.append(float(screen_y_norm))
-        # sample weight จาก quality + บูสต์จุดบน/ล่าง (ช่วยแกน Y)
-        q = float(self.sess.last_quality or 0.5)
-        w_q = max(0.0, min(1.0, (q - 0.20) / 0.80)) ** 2
-        w_y = 1.0 + 0.6 * abs(screen_y_norm - 0.5) * 2.0
-        w = (0.5 + 1.5 * w_q) * w_y
-        self.sess.calib_w.append(float(w))
-        return True
-
-    def _compute_report(self, X: np.ndarray, Y: np.ndarray) -> CalibrationReport:
-        W, H = int(self.cfg.screen_w), int(self.cfg.screen_h)
-        pred_train = self._map_from_feat_batch(X)
-        rmse_train = _rmse_px(pred_train, Y, W, H)
-
-        # CV
-        def _cv_rmse():
-            n = len(X)
-            if n < 5: return float('inf')
-            if n >= 9:
-                k = max(2, min(5, n // 3))
-                idx = np.arange(n); np.random.shuffle(idx)
-                folds = np.array_split(idx, k)
-                acc=[]
-                for i in range(k):
-                    te = folds[i]
-                    tr = np.concatenate([folds[j] for j in range(k) if j != i])
-                    model = _make_model()
-                    model = _fit_model_dispatch(model, X[tr], Y[tr])
-                    pred = _predict_dispatch(model, X[te])
-                    acc.append(_rmse_px(pred, Y[te], W, H))
-                return float(np.mean(acc))
-            else:
-                reps=3; acc=[]
-                for _ in range(reps):
-                    idx = np.arange(n); np.random.shuffle(idx)
-                    cut = max(2, int(0.8*n))
-                    tr, te = idx[:cut], idx[cut:]
-                    model = _make_model()
-                    model = _fit_model_dispatch(model, X[tr], Y[tr])
-                    pred = _predict_dispatch(model, X[te])
-                    acc.append(_rmse_px(pred, Y[te], W, H))
-                return float(np.mean(acc))
-
-        rmse_cv = _cv_rmse()
-        unif = _uniformity_score(Y)
-        return CalibrationReport(
-            n_points=len(X), rmse_px=rmse_train, rmse_cv_px=rmse_cv,
-            uniformity=unif, width=W, height=H
-        )
-
-    def calibration_finish(self):
-        n = len(self.sess.calib_X)
-        if n < 6:
-            self.sess.model_ready = False; self.sess.model_pipeline = None
-            self.sess.calib_report = None
-            return {'ok': False, 'msg': 'ต้องเก็บคาลิเบรทอย่างน้อย 6 จุด'}
-
-        X = np.array(self.sess.calib_X, dtype=np.float32)           # (N x 5)
-        Y = np.stack([np.array(self.sess.calib_yx, dtype=np.float32),
-                      np.array(self.sess.calib_yy, dtype=np.float32)], axis=1)  # (N x 2)
-        Wsamples = np.array(self.sess.calib_w if self.sess.calib_w else [1.0]*n, dtype=np.float32)  # (N,)
-
-        # poly degree=2 + Eye-first penalties
-        Phi = _poly_expand(X)  # (N x D)
-        pen_vec = _build_penalty_vector(n_base=X.shape[1], eye_pen=0.1, face_pen=6.0, bias_pen=0.5)
-        lam = 1e-3
-
-        # ฟิต weighted ridge แยกแกน x,y
-        wx = _fit_weighted_ridge(Phi, Y[:, 0], Wsamples, pen_vec, lam)
-        wy = _fit_weighted_ridge(Phi, Y[:, 1], Wsamples, pen_vec, lam)
-        self.sess.model_pipeline = (wx, wy)
-        self.sess.model_ready = True
-
-        # รายงาน
-        rep = self._compute_report(X, Y)
-        self.sess.calib_report = rep
-        preds = self._map_from_feat_batch(X)
-        rmse_norm = float(np.sqrt(np.mean((preds - Y) ** 2)))
-
-        return {
-            'ok': True, 'rmse_norm': rmse_norm, 'n': n,
-            'rmse_px': rep.rmse_px, 'rmse_cv_px': rep.rmse_cv_px, 'uniformity': rep.uniformity,
-            'passed': rep.passed()
-        }
-
-    # Save/Load
-    def save_profile(self, path: str, meta: dict=None):
-        p = pathlib.Path(path)
-        data = {
-            "calib_X": self.sess.calib_X, "calib_yx": self.sess.calib_yx, "calib_yy": self.sess.calib_yy,
-            "screen": {"w": self.cfg.screen_w, "h": self.cfg.screen_h}, "meta": meta or {}
-        }
-        try: p.write_text(json.dumps(data)); return True
-        except Exception: return False
-
-    def load_profile(self, path: str):
-        p = pathlib.Path(path)
-        if not p.exists(): return False
-        try:
-            data = json.loads(p.read_text())
-            self.sess.calib_X = data.get("calib_X", [])
-            self.sess.calib_yx = data.get("calib_yx", [])
-            self.sess.calib_yy = data.get("calib_yy", [])
-            sc = data.get("screen", {})
-            if sc:
-                self.cfg.screen_w = sc.get("w", self.cfg.screen_w)
-                self.cfg.screen_h = sc.get("h", self.cfg.screen_h)
-            rep = self.calibration_finish()
-            return bool(rep.get("ok", False))
-        except Exception:
-            return False
-
-    # Drift
-    def drift_start(self): self.sess.drift_enabled = True
-    def drift_stop(self): self.sess.drift_enabled = False
-    def drift_add(self, screen_x_norm: float, screen_y_norm: float):
-        if self.sess.last_feat is None: return False
-        pred = self._map_from_feat(self.sess.last_feat)
-        ex = screen_x_norm - pred[0]; ey = screen_y_norm - pred[1]
-        a = self.sess.drift_alpha
-        self.sess.drift_dx = (1 - a) * self.sess.drift_dx + a * ex
-        self.sess.drift_dy = (1 - a) * self.sess.drift_dy + a * ey
-        return True
-
-    def drift_status(self): return {'enabled': self.sess.drift_enabled, 'dx': self.sess.drift_dx, 'dy': self.sess.drift_dy}
-
-    # Mapping
-    def _map_from_feat(self, feat_vec: np.ndarray) -> np.ndarray:
-        # แผนที่แบบตาล้วน (ไม่ใช้ใบหน้า) — ช่วยยกสัญญาณ Y และลด head-coupling
-        ex, ey = float(feat_vec[0]), float(feat_vec[1])
-        eye_only = np.array([
-            0.5 + (ex - 0.5) * self.cfg.fallback_kx,
-            0.5 + (ey - 0.5) * self.cfg.fallback_ky
-        ], dtype=np.float32)
-
-        if self.sess.model_ready and self.sess.model_pipeline is not None:
-            pm = _predict_dispatch(self.sess.model_pipeline, feat_vec[None, :])[0]
-            alpha_x = 0.30  # ผสานกลับมาตาล้วนเล็กน้อยสำหรับ X
-            alpha_y = 0.55  # ผสานกลับมาตาล้วนมากกว่าใน Y
-            px = (1.0 - alpha_x) * pm[0] + alpha_x * eye_only[0]
-            py = (1.0 - alpha_y) * pm[1] + alpha_y * eye_only[1]
-            return np.array([px, py], dtype=np.float32)
-        else:
-            return eye_only
-
-    def _map_from_feat_batch(self, X: np.ndarray) -> np.ndarray:
-        if X.ndim == 1: X = X[None, :]
-        if self.sess.model_ready and self.sess.model_pipeline is not None:
-            return _predict_dispatch(self.sess.model_pipeline, X)
-        ex, ey = X[:,0], X[:,1]
-        x = 0.5 + (ex - 0.5) * self.cfg.fallback_kx
-        y = 0.5 + (ey - 0.5) * self.cfg.fallback_ky
-        return np.stack([x, y], axis=1).astype(np.float32)
-
-    def _shape_and_smooth(self, x: float, y: float) -> Tuple[float, float]:
-        if self.sess.drift_enabled: x += self.sess.drift_dx; y += self.sess.drift_dy
-        gx = self.cfg.gain * self.cfg.gain_x; gy = self.cfg.gain * self.cfg.gain_y
-        x = 0.5 + (x - 0.5) * gx; y = 0.5 + (y - 0.5) * gy
-        if self.cfg.gamma != 1.0:
-            def _gamma(v):
-                s = (v - 0.5); sign = 1.0 if s >= 0 else -1.0
-                return 0.5 + sign * (abs(s) ** self.cfg.gamma)
-            x = _gamma(x); y = _gamma(y)
-        dz = self.cfg.deadzone
-        def _dead(v): d = v - 0.5; return 0.5 if abs(d) < dz else v
-        x = _dead(x); y = _dead(y)
-        x = min(1.0, max(0.0, x)); y = min(1.0, max(0.0, y))
-        t = time.time(); x = float(self.sess.smooth_x.filter(x, t)); y = float(self.sess.smooth_y.filter(y, t))
-        return x, y
-
-    # Processing
-    def process_frame(self, frame_bgr) -> Tuple[float, float, dict, np.ndarray]:
-        t0 = time.time()
-        feat = self.ext.extract(frame_bgr)
-        if feat is None:
-            pred = np.array([0.5, 0.5], dtype=np.float32)
-            q = 0.2; eye_open = True
-        else:
-            if (not feat.get("eye_open", True)) and self.sess.last_feat is not None:
-                fv = self.sess.last_feat
-            else:
-                fv = _feat_vec(feat); self.sess.last_feat = fv
-            pred = self._map_from_feat(fv)
-            q = float(feat.get("quality", 0.5))
-            eye_open = bool(feat.get("eye_open", True))
-            self.sess.last_quality = q  # NEW: เก็บคุณภาพล่าสุด
-
-        # stabilize -> shape/smooth
-        px, py = float(pred[0]), float(pred[1])
-        px, py = self._stabilize(px, py, q, eye_open)
-        x, y = self._shape_and_smooth(px, py)
-
-        t1 = time.time()
-        if self.sess.t_prev is not None:
-            dt = t1 - self.sess.t_prev
-            if dt > 0:
-                self.sess.fps_hist.append(1.0 / dt)
-                if len(self.sess.fps_hist) > 90: self.sess.fps_hist = self.sess.fps_hist[-90:]
-        self.sess.t_prev = t1
-        metrics = {
-            'fps': float(np.mean(self.sess.fps_hist)) if len(self.sess.fps_hist) else 0.0,
-            'latency_ms': float((t1 - t0) * 1000.0),
-            'model': 'calibrated' if self.sess.model_ready else 'fallback'
-        }
-        return x, y, metrics, frame_bgr
-
-    def process_external(self, nx: float, ny: float) -> Tuple[float, float]:
-        fv = np.array([nx, ny, 0.5, 0.5, 1.0], dtype=np.float32)
-        self.sess.last_feat = fv
-        pred = self._map_from_feat(fv)
-        px, py = float(pred[0]), float(pred[1])
-        px, py = self._stabilize(px, py, 0.5, True)
-        x, y = self._shape_and_smooth(px, py)
-        self.sess.last_quality = 0.5  # NEW: ค่ากลางสำหรับ external feed
-        return x, y
-
-    # Reporting & gate
-    def get_report(self):
-        rmse = None
-        if self.sess.model_ready and len(self.sess.calib_X) >= 6:
-            X = np.array(self.sess.calib_X, dtype=np.float32)
-            Y = np.stack([np.array(self.sess.calib_yx, dtype=np.float32),
-                          np.array(self.sess.calib_yy, dtype=np.float32)], axis=1)
-            preds = self._map_from_feat_batch(X)
-            rmse = float(np.sqrt(np.mean((preds - Y) ** 2)))
-        return {'model_ready': self.sess.model_ready, 'rmse_norm': rmse, 'n_samples': len(self.sess.calib_X)}
-
-    def get_calibration_report(self) -> Optional[CalibrationReport]:
-        return self.sess.calib_report
-
-    def click_gate(self) -> Tuple[bool, str]:
-        rep = self.sess.calib_report
-        if rep is None:
-            return False, "ยังไม่คาลิเบรท"
-        reasons = []
-        if rep.n_points < 9: reasons.append(f"จุดน้อย ({rep.n_points}/9)")
-        if rep.uniformity < 0.55: reasons.append(f"กระจายตัวต่ำ ({rep.uniformity:.2f})")
-        if rep.rmse_px is None or rep.rmse_px > 30.0: reasons.append(f"RMSE เทรน {rep.rmse_px:.0f}px > 30px" if rep.rmse_px is not None else "RMSE เทรนไม่พร้อม")
-        if rep.rmse_cv_px is None or rep.rmse_cv_px > 35.0: reasons.append(f"RMSE CV {rep.rmse_cv_px:.0f}px > 35px" if rep.rmse_cv_px is not None else "RMSE CV ไม่พร้อม")
-        passed = (len(reasons) == 0)
-        return passed, ("ผ่าน" if passed else " , ".join(reasons))
-
-# ----------------------------- App State -----------------------------
-class AppState:
-    def __init__(self):
-        # Modes / IO
-        self.extractor_mode = 'Webcam/MediaPipe'
-        self.mouse_enabled = False      # user toggle
-        self.dwell_ms = 700
-        self.dwell_radius = 40
-        self.esp32_url = 'http://esp32.local/stream'
-        self.esp32_q: Optional[queue.Queue] = None
-        self.esp32_stop: Optional[threading.Event] = None
-        self.synthetic_hud = False
-        # Diagnostics
-        self.log_enabled = False
-        self.log_path = 'gaze_metrics.jsonl'
-        # Axes & mirror
-        self.mirror_input = False
-        self.invert_x = False
-        self.invert_y = False
-        # Shaping & filtering
-        self.gain = 1.2       # เริ่มสูงเล็กน้อย ช่วยไปถึงมุมช่วง fallback
-        self.gamma = 1.0
-        self.deadzone = 0.02
-        self.filter_mincutoff = 1.0
-        self.filter_beta = 0.01
-        # Shared gaze
-        self.shared_gaze_x = 0.5
-        self.shared_gaze_y = 0.5
-        # Calibration (global)
-        self.calib_overlay_active = False
-        self.calib_targets: List[Tuple[float, float]] = []
-        self.calib_idx = 0
-        self.calib_dwell_ms = 1000  # ให้เวลาถือมากขึ้นตอนเริ่ม
-        self.calib_radius_norm = 0.02  # ~2% ของจอ
-        # Gate status
-        self.mouse_gate_passed = False
-        self.mouse_gate_reason = "ยังไม่คาลิเบรท"
-
-# persist
-if 'APP_STATE' not in st.session_state:
-    st.session_state['APP_STATE'] = AppState()
-APP_STATE: AppState = st.session_state['APP_STATE']
-
-# placeholder (CSS overlay only)
-if "calib_ph" not in st.session_state:
-    st.session_state["calib_ph"] = st.empty()
-
-# ----------------------------- Streamlit WebRTC Processor -----------------------------
-class GazeProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.engine: Optional[GazeEngine] = None
-        self.mouse: Optional[MouseController] = None
-        self.last_gaze = (0.5, 0.5)
-        # Calibration-in-video state
-        self.calib_active = False
-        self.calib_targets = []
-        self.calib_idx = 0
-        self.calib_hold_start = None
-        self.calib_radius_norm = 0.02
-        self._calib_banner_until = 0.0
-        self._calib_banner_text = ""
-
-    def recv(self, frame: VideoFrame) -> VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
-
-        # mirror webcam image before extract
-        if APP_STATE.extractor_mode == 'Webcam/MediaPipe' and APP_STATE.mirror_input and cv2 is not None:
-            img = cv2.flip(img, 1)
-
-        if APP_STATE.extractor_mode == 'ESP32 (Orlosky)' and getattr(APP_STATE, 'synthetic_hud', False):
-            img = np.full((480, 640, 3), 40, dtype=np.uint8)
-
-        if self.engine is None:
-            extractor = FeatureExtractor(use_mediapipe=(APP_STATE.extractor_mode == 'Webcam/MediaPipe'))
-            cfg = GazeConfig()
-            self.engine = GazeEngine(cfg, extractor)
-            self.mouse = MouseController(enable=False,
-                                         dwell_ms=APP_STATE.dwell_ms,
-                                         dwell_radius_px=APP_STATE.dwell_radius)
-
-        # Apply shaping/filter params
-        try:
-            self.engine.update_config(gain=float(APP_STATE.gain), gamma=float(APP_STATE.gamma), deadzone=float(APP_STATE.deadzone))
-            for f in (self.engine.sess.smooth_x, self.engine.sess.smooth_y):
-                f.mincutoff = float(APP_STATE.filter_mincutoff)
-                f.beta = float(APP_STATE.filter_beta)
-        except Exception:
-            pass
-
-        # === Calibration Assist: ขยายระยะวิ่ง + ปิด deadzone เฉพาะตอน calibrating ===
-        if APP_STATE.calib_overlay_active and self.engine is not None:
-            if not hasattr(self, "_saved_calib_assist"):
-                self._saved_calib_assist = (
-                    self.engine.cfg.fallback_kx, self.engine.cfg.fallback_ky, self.engine.cfg.deadzone
-                )
-            self.engine.cfg.fallback_kx = max(self.engine.cfg.fallback_kx, 2.0)
-            self.engine.cfg.fallback_ky = max(self.engine.cfg.fallback_ky, 1.8)
-            self.engine.cfg.deadzone = 0.0
-        else:
-            if hasattr(self, "_saved_calib_assist") and self.engine is not None:
-                fbk, fby, dz = self._saved_calib_assist
-                self.engine.cfg.fallback_kx, self.engine.cfg.fallback_ky = fbk, fby
-                self.engine.cfg.deadzone = dz
-                delattr(self, "_saved_calib_assist")
-
-        # per-frame processing
-        if APP_STATE.extractor_mode == 'Webcam/MediaPipe':
-            x, y, metrics, img = self.engine.process_frame(img)
-        else:
-            x, y = self.last_gaze
-            if APP_STATE.esp32_q is not None:
                 try:
-                    nx, ny = APP_STATE.esp32_q.get_nowait()
-                    x, y = self.engine.process_external(nx, ny)
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 except Exception:
                     pass
-            metrics = self.engine.get_report()
+                if not cap.isOpened():
+                    time.sleep(1.0)
+                    continue
+                while not self.stop.is_set():
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        break
+                    res = self.iris.detect(frame)
+                    if res is not None:
+                        nx, ny = res
+                        feat = Features(nx, ny, 0.5, 0.5, True, 0.5)  # face=0.5 (ไม่ใช้), quality~กลาง
+                        try:
+                            self.q.put(feat, timeout=0.01)
+                        except Exception:
+                            pass
+            except Exception:
+                time.sleep(0.5)
+            finally:
+                if cap is not None:
+                    cap.release()
 
-        # invert axes (if chosen)
-        if APP_STATE.invert_x: x = 1.0 - x
-        if APP_STATE.invert_y: y = 1.0 - y
-        self.last_gaze = (x, y)
-
-        # share gaze for other UI
-        APP_STATE.shared_gaze_x = float(x)
-        APP_STATE.shared_gaze_y = float(y)
-
-        # ==== Calibration flow INSIDE video (no page refresh) ====
-        if APP_STATE.calib_overlay_active:
-            if not self.calib_active:
-                self.calib_active = True
-                self.calib_targets = list(APP_STATE.calib_targets)
-                self.calib_idx = APP_STATE.calib_idx
-                self.calib_hold_start = None
-                self.calib_radius_norm = float(APP_STATE.calib_radius_norm)
-
-            if 0 <= self.calib_idx < len(self.calib_targets):
-                tx, ty = self.calib_targets[self.calib_idx]
-            else:
-                tx, ty = (0.5, 0.5)
-
-            # ---- hold timing with early-wide radius for first 3 points ----
-            early_wide = 0.06  # 6% ของจอ
-            radius_now = self.calib_radius_norm if self.calib_idx >= 3 else max(self.calib_radius_norm, early_wide)
-
-            dist_norm = math.hypot(x - tx, y - ty)
-            now = time.time()
-            if dist_norm <= radius_now:
-                if self.calib_hold_start is None:
-                    self.calib_hold_start = now
-                elapsed_ms = (now - self.calib_hold_start) * 1000.0
-            else:
-                self.calib_hold_start = None
-                elapsed_ms = 0.0
-            frac = max(0.0, min(1.0, elapsed_ms / float(max(1, APP_STATE.calib_dwell_ms))))
-
-            # draw target/progress + hint
-            if cv2 is not None:
-                h, w = img.shape[:2]
-                gx, gy = int(tx * w), int(ty * h)
-                cv2.circle(img, (gx, gy), 18, (0, 170, 255), 2)
-                end_angle = int(360 * frac)
-                cv2.ellipse(img, (gx, gy), (22, 22), 0, 0, end_angle, (0, 170, 255), 3)
-                cv2.putText(img, f"Calibration {min(self.calib_idx+1,len(self.calib_targets))}/{len(self.calib_targets)}",
-                            (24, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
-                if self.engine.sess.last_feat is None:
-                    cv2.putText(img, "No eye feature detected - adjust lighting/pose",
-                                (24, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 120, 255), 2)
-
-            # ---- commit point (ต้องมีฟีเจอร์ก่อน) ----
-            if frac >= 1.0 and 0 <= self.calib_idx < len(self.calib_targets):
-                ok_added = False
-                if self.engine.sess.last_feat is not None:
-                    ok_added = self.engine.calibration_add_point(tx, ty)
-                if ok_added:
-                    self.calib_idx += 1
-                    APP_STATE.calib_idx = self.calib_idx
-                    self.calib_hold_start = None
-
-                if self.calib_idx >= len(self.calib_targets):
-                    rep = self.engine.calibration_finish()
-                    APP_STATE.calib_overlay_active = False
-                    self.calib_active = False
-                    if rep.get('ok'):
-                        tag = "PASS" if rep.get('passed') else "LOCK"
-                        self._calib_banner_text = f"Calibration OK · RMSE={rep.get('rmse_px',0):.0f}px / CV={rep.get('rmse_cv_px',0):.0f}px · U={rep.get('uniformity',0):.2f} · {tag}"
-                    else:
-                        self._calib_banner_text = f"Calibration NG: {rep.get('msg','')}"
-                    self._calib_banner_until = time.time() + 2.0
+class FeatureExtractor:
+    def __init__(self, use_mediapipe=True):
+        self.use = use_mediapipe and (mp is not None) and (cv2 is not None)
+        if self.use:
+            self.mesh=mp.solutions.face_mesh.FaceMesh(static_image_mode=False,refine_landmarks=True,max_num_faces=1,
+                                                      min_detection_confidence=0.5,min_tracking_confidence=0.5)
         else:
-            self.calib_active = False
-            self.calib_hold_start = None
+            self.mesh=None
+        self._emaL=self._emaR=None; self._alpha=0.05
+        # landmark ids
+        self.LI=[468,469,470,471,472]; self.RI=[473,474,475,476,477] if self.use else self.LI
+        self.LE=[33,133,159,145]; self.RE=[362,263,386,374]
+    def close(self):
+        try:
+            if self.mesh: self.mesh.close()
+        except Exception: pass
+    @staticmethod
+    def _avg(ids, pts):
+        xs=[pts[i][0] for i in ids if i<len(pts)]; ys=[pts[i][1] for i in ids if i<len(pts)]
+        if not xs or not ys: return None
+        return (sum(xs)/len(xs), sum(ys)/len(ys))
+    @staticmethod
+    def _eye_box(ids, pts):
+        xs=[pts[i][0] for i in ids if i<len(pts)]; ys=[pts[i][1] for i in ids if i<len(pts)]
+        if not xs or not ys: return None
+        x0,x1=min(xs),max(xs); y0,y1=min(ys),max(ys)
+        w=max(6.0,x1-x0); h=max(2.0,y1-y0); ear=h/max(6.0,w)
+        return (x0,x1,y0,y1,w,h,ear)
+    def _norm_in(self, p, box):
+        if p is None or box is None: return (0.5,0.5)
+        x0,x1,y0,y1,w,h,_=box
+        nx=(p[0]-x0)/w; ny=(p[1]-y0)/h
+        return (min(1.0,max(0.0,nx)), min(1.0,max(0.0,ny)))
+    def extract(self, frame_bgr) -> Features | None:
+        if frame_bgr is None: return None
+        if not self.use:
+            return Features(0.5,0.5,0.5,0.5,True,0.2)
+        h,w=frame_bgr.shape[:2]
+        res=self.mesh.process(cv2.cvtColor(frame_bgr,cv2.COLOR_BGR2RGB))
+        if not res.multi_face_landmarks: return None
+        lm=res.multi_face_landmarks[0]
+        pts=[(lm.landmark[i].x*w, lm.landmark[i].y*h) for i in range(len(lm.landmark))]
+        l_iris=self._avg(self.LI,pts); r_iris=self._avg(self.RI,pts)
+        l_box=self._eye_box(self.LE,pts); r_box=self._eye_box(self.RE,pts)
+        l_n=self._norm_in(l_iris,l_box) if l_iris else (0.5,0.5)
+        r_n=self._norm_in(r_iris,r_box) if r_iris else (0.5,0.5)
+        earL=l_box[6] if l_box else None; earR=r_box[6] if r_box else None
+        def _upd(cur,base): 
+            if cur is None: return base
+            return cur if base is None else (base*(1.0-self._alpha)+cur*self._alpha)
+        if earL and earL>0.18: self._emaL=_upd(earL,self._emaL)
+        if earR and earR>0.18: self._emaR=_upd(earR,self._emaR)
+        def _eye_conf(ear, base, box, ok):
+            if (ear is None) or (box is None) or (not ok): return 0.0
+            ratio = (ear/0.26) if base is None else (ear/max(1e-6,0.8*base)); ratio=max(0.0,min(1.4,ratio))
+            bw,bh=box[4],box[5]; area=((bw*bh)/(w*h))
+            return max(0.0,min(1.0, 0.7*ratio + 0.3*min(1.0, area/0.02)))
+        cL=_eye_conf(earL,self._emaL,l_box,l_iris is not None)
+        cR=_eye_conf(earR,self._emaR,r_box,r_iris is not None)
+        wL,wR=cL,cR
+        if (wL+wR)<1e-3:
+            ex,ey=0.5,0.5
+        else:
+            ex=float((l_n[0]*wL + r_n[0]*wR)/(wL+wR))
+            ey=float((l_n[1]*wL + r_n[1]*wR)/(wL+wR))
+        face_ids=[1,9,152,33,263]
+        fxs=[pts[i][0] for i in face_ids if i<len(pts)]; fys=[pts[i][1] for i in face_ids if i<len(pts)]
+        fcx=float(sum(fxs)/len(fxs)/max(1,w)) if fxs else 0.5
+        fcy=float(sum(fys)/len(fys)/max(1,h)) if fys else 0.5
+        margin=min(ex,1-ex,ey,1-ey); quality=max(cL,cR)*(0.6+0.4*max(0.0,min(1.0,margin*2)))
+        return Features(ex,ey,fcx,fcy, bool((earL or 0.0)>0.2 or (earR or 0.0)>0.2), float(quality))
 
-        # banner after calibration done
-        if time.time() < self._calib_banner_until and cv2 is not None and self._calib_banner_text:
-            cv2.rectangle(img, (10, 10), (10+900, 10+40), (0,0,0), -1)
-            cv2.putText(img, self._calib_banner_text, (18, 38),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 230, 255), 2)
+# ========================= Model / Mapping =========================
+def _poly_expand(X: np.ndarray) -> np.ndarray:
+    if X.ndim==1: X=X[None,:]
+    cols=[X]; n=X.shape[1]
+    for i in range(n):
+        for j in range(i,n):
+            cols.append((X[:,i]*X[:,j])[:,None])
+    return np.concatenate(cols,axis=1)
 
-        # ---- Click Gate ----
-        gate_ok, reason = (False, "ยังไม่คาลิเบรท")
-        if self.engine is not None:
-            gate_ok, reason = self.engine.click_gate()
-        APP_STATE.mouse_gate_passed = bool(gate_ok)
-        APP_STATE.mouse_gate_reason = reason
+def _rmse_px(pred_xy, true_xy, W, H) -> float:
+    dx=(pred_xy[:,0]-true_xy[:,0])*W; dy=(pred_xy[:,1]-true_xy[:,1])*H
+    return float(np.sqrt(np.mean(dx*dx + dy*dy)))
 
-        # Mouse: pointer follows; click only if gate_ok
-        if self.mouse:
-            self.mouse.set_enable(APP_STATE.mouse_enabled)
-            self.mouse.dwell_ms = APP_STATE.dwell_ms
-            self.mouse.dwell_radius_px = APP_STATE.dwell_radius
-            self.mouse.update(x, y, do_click=(APP_STATE.mouse_enabled and gate_ok))
+def _mae_px(pred_xy, true_xy, W, H) -> float:
+    dx=np.abs((pred_xy[:,0]-true_xy[:,0])*W); dy=np.abs((pred_xy[:,1]-true_xy[:,1])*H)
+    return float(np.mean(np.sqrt(dx*dx + dy*dy)))
 
-        # crosshair
+def _uniformity_score(pts_norm: np.ndarray) -> float:
+    pts=np.asarray(pts_norm,float)
+    if len(pts)<3: return 0.0
+    pts=pts[np.lexsort((pts[:,1],pts[:,0]))]
+    def cross(o,a,b): return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+    lower=[]; upper=[]
+    for p in pts:
+        while len(lower)>=2 and cross(lower[-2], lower[-1], p)<=0: lower.pop()
+        lower.append(p)
+    for p in pts[::-1]:
+        while len(upper)>=2 and cross(upper[-2], upper[-1], p)<=0: upper.pop()
+        upper.append(p)
+    hull=np.vstack([lower[:-1], upper[:-1]])
+    area=0.0
+    for i in range(len(hull)):
+        x1,y1=hull[i]; x2,y2=hull[(i+1)%len(hull)]
+        area+=x1*y2 - x2*y1
+    return float(max(0.0, min(1.0, abs(area)/2.0)))
+
+class GazeModel:
+    """แปลง Features -> (x,y) ด้วยโพลีโนเมียล + compensation (bias/gain)"""
+    def __init__(self):
+        self.wx=None; self.wy=None
+        self.comp=(1.0,0.0,1.0,0.0); self.comp_valid=False
+    @staticmethod
+    def feat_vec(f: Features) -> np.ndarray:
+        ex,ey=float(f.eye_cx_norm),float(f.eye_cy_norm)
+        fx,fy=float(f.face_cx_norm),float(f.face_cy_norm)
+        fx = 0.5 + (fx-0.5)*0.3; fy = 0.5 + (fy-0.5)*0.3
+        return np.array([ex,ey,fx,fy,1.0],dtype=np.float32)
+    def fit(self, X: np.ndarray, Y: np.ndarray):
+        Phi=_poly_expand(X); lam=1e-3
+        A=Phi.T@Phi + lam*np.eye(Phi.shape[1])
+        self.wx=np.linalg.solve(A, Phi.T@Y[:,0])
+        self.wy=np.linalg.solve(A, Phi.T@Y[:,1])
+        # fit comp
+        pred=self.predict_batch(X, apply_comp=False)
+        def fit_axis(p,t):
+            p=np.asarray(p,float); t=np.asarray(t,float)
+            var=np.var(p); 
+            if var<1e-6: return 1.0,0.0
+            cov=np.cov(p,t,bias=True)[0,1]; a=float(np.clip(cov/var,0.8,1.3))
+            b=float(np.clip(np.mean(t)-a*np.mean(p), -0.15, 0.15))
+            return a,b
+        ax,bx=fit_axis(pred[:,0],Y[:,0]); ay,by=fit_axis(pred[:,1],Y[:,1])
+        self.comp=(ax,bx,ay,by); self.comp_valid=True
+    def predict_batch(self, X: np.ndarray, apply_comp=True) -> np.ndarray:
+        Phi=_poly_expand(X); pred=np.stack([Phi@self.wx, Phi@self.wy],axis=1).astype(np.float32)
+        if apply_comp and self.comp_valid:
+            ax,bx,ay,by=self.comp
+            pred[:,0]=ax*pred[:,0]+bx; pred[:,1]=ay*pred[:,1]+by
+        return np.clip(pred,0.0,1.0)
+    def predict_one(self, v: np.ndarray, apply_comp=True) -> np.ndarray:
+        return self.predict_batch(v[None,:], apply_comp=apply_comp)[0]
+
+# ========================= Calibrator FSM =========================
+class CalibratorFSM:
+    """IDLE -> COLLECT -> FIT -> REPORT (+optional AUTO_EXTEND)"""
+    def __init__(self):
+        self.state="IDLE"
+        self.targets: list[tuple[float,float]]=[]
+        self.idx=0
+        self.X=[]; self.Y=[]; self.W=[]
+        self.report: CalibrationReport | None = None
+        self.auto_extended=False
+    def start(self, targets: list[tuple[float,float]]):
+        self.targets=list(targets); self.idx=0; self.X=[]; self.Y=[]; self.W=[]
+        self.state="COLLECT"; self.report=None
+    def add(self, feat_vec: np.ndarray, target: tuple[float,float], quality: float):
+        if self.state!="COLLECT": return
+        sx,sy=target
+        q=max(0.0,min(1.0,(quality-0.20)/0.80))**2
+        w=0.5+1.5*q
+        self.X.append(feat_vec.tolist()); self.Y.append([float(sx),float(sy)])
+        # ให้ความสำคัญกับมุม/ขอบมากขึ้น
+        w *= (1.0 + 0.6*abs(sx-0.5)*2.0 + 0.6*abs(sy-0.5)*2.0) * 0.5
+        self.W.append(float(w))
+        self.idx += 1
+        if self.idx>=len(self.targets):
+            self.state="FIT"
+    def fit_and_report(self, model: GazeModel, screen_wh: tuple[int,int]) -> CalibrationReport:
+        self.state="FIT"
+        X=np.array(self.X,dtype=np.float32); Y=np.array(self.Y,dtype=np.float32)
+        model.fit(X,Y)
+        pred=model.predict_batch(X, apply_comp=False)
+        W,H=screen_wh
+        rmse_px=_rmse_px(pred,Y,W,H)
+        mae_px=_mae_px(pred,Y,W,H)
+        rmse_norm=float(np.sqrt(np.mean((pred-Y)**2)))
+        mae_norm=float(np.mean(np.sqrt(np.sum((pred-Y)**2,axis=1))))
+        # CV (k-fold or holdout)
+        n=len(X)
+        if n>=9:
+            k=max(2,min(5,n//3)); idx=np.arange(n); np.random.shuffle(idx); folds=np.array_split(idx,k)
+            acc=[]
+            for i in range(k):
+                te=folds[i]; tr=np.concatenate([folds[j] for j in range(k) if j!=i])
+                m=GazeModel(); m.fit(X[tr],Y[tr]); pr=m.predict_batch(X[te], apply_comp=False)
+                acc.append(_rmse_px(pr,Y[te],W,H))
+            rmse_cv=float(np.mean(acc))
+        else:
+            cut=max(2,int(0.8*n)); idx=np.arange(n); np.random.shuffle(idx); tr,te=idx[:cut],idx[cut:]
+            m=GazeModel(); m.fit(X[tr],Y[tr]); pr=m.predict_batch(X[te], apply_comp=False)
+            rmse_cv=float(_rmse_px(pr,Y[te],W,H))
+        unif=_uniformity_score(Y)
+        rep=CalibrationReport(n_points=n, rmse_px=rmse_px, rmse_cv_px=rmse_cv, mae_px=mae_px,
+                              rmse_norm=rmse_norm, mae_norm=mae_norm, uniformity=unif, width=W, height=H)
+        self.report=rep; self.state="REPORT"
+        return rep
+
+# ========================= Engine (core orchestrator) =========================
+class GazeEngine:
+    def __init__(self):
+        self.model=GazeModel()
+        self.fx=OneEuro(); self.fy=OneEuro()
+        self.last_feat_vec=None
+        self.comp_alpha=1.0; self.comp_enabled=True
+        self.fps_hist=[]; self.t_prev=None
+        self.last_metrics=Metrics(0.0,0.0,"fallback")
+        self.eval_csv="gaze_eval_log.csv"
+        self.calib=CalibratorFSM()
+        self.gate={"rmse_train":45.0,"rmse_cv":55.0,"uniformity":0.50,"min_pts":9}
+        self.screen=_safe_size()
+        self.fallback_kx=1.8; self.fallback_ky=1.6
+        self.deadzone=0.02; self.gain=1.2; self.gamma=1.0
+        self.model_ready=False
+    def set_screen(self, w:int, h:int): self.screen=(int(w),int(h))
+    def set_comp(self, enabled:bool, alpha:float): self.comp_enabled=enabled; self.comp_alpha=float(max(0.0,min(1.0,alpha)))
+    def set_gate(self, rmse_train, rmse_cv, uniformity, min_pts=9):
+        self.gate={"rmse_train":float(rmse_train),"rmse_cv":float(rmse_cv),"uniformity":float(uniformity),"min_pts":int(min_pts)}
+    def set_shape(self, gain, gamma, deadzone): self.gain=float(gain); self.gamma=float(gamma); self.deadzone=float(deadzone)
+    def _shape(self, x:float, y:float) -> tuple[float,float]:
+        # gain
+        x=0.5+(x-0.5)*self.gain; y=0.5+(y-0.5)*self.gain
+        # gamma
+        if self.gamma!=1.0:
+            def g(v):
+                s=v-0.5; sign=1.0 if s>=0 else -1.0
+                return 0.5 + sign*(abs(s)**self.gamma)
+            x=g(x); y=g(y)
+        # deadzone
+        dz=self.deadzone
+        if abs(x-0.5)<dz: x=0.5
+        if abs(y-0.5)<dz: y=0.5
+        return min(1.0,max(0.0,x)), min(1.0,max(0.0,y))
+    def _fallback(self, ex,ey):
+        return 0.5+(ex-0.5)*self.fallback_kx, 0.5+(ey-0.5)*self.fallback_ky
+    def map_once(self, feat: Features) -> tuple[GazePoint, Metrics]:
+        t0=_now_perf()
+        fv=GazeModel.feat_vec(feat)
+        # keep last good
+        if self.last_feat_vec is None or feat.eye_open:
+            self.last_feat_vec=fv
+        # base pred
+        if self.model_ready and (self.model.wx is not None):
+            pm=self.model.predict_one(self.last_feat_vec, apply_comp=self.comp_enabled)
+            # blend with fallback (เล็กน้อย) ให้ทนต่อ drift
+            fb=np.array(self._fallback(fv[0],fv[1]),dtype=np.float32)
+            px=(0.9*pm[0]+0.1*fb[0]); py=(0.85*pm[1]+0.15*fb[1])
+        else:
+            px,py=self._fallback(fv[0],fv[1])
+        # shape
+        px,py=self._shape(px,py)
+        # smooth
+        tnow=_now_perf(); sx=float(self.fx.filter(px,tnow)); sy=float(self.fy.filter(py,tnow))
+        # metrics
+        t1=_now_perf()
+        if self.t_prev is not None:
+            dt=t1-self.t_prev
+            if dt>0:
+                self.fps_hist.append(1.0/dt)
+                if len(self.fps_hist)>90: self.fps_hist=self.fps_hist[-90:]
+        self.t_prev=t1
+        fps=float(np.mean(self.fps_hist)) if self.fps_hist else 0.0
+        latency_ms=float((t1-t0)*1000.0)
+        self.last_metrics=Metrics(fps,latency_ms, "calibrated" if self.model_ready else "fallback")
+        return GazePoint(sx,sy), self.last_metrics
+    # ---------- Calibration ----------
+    def calib_start(self, targets: list[tuple[float,float]]): self.calib.start(targets)
+    def calib_collect_if_ready(self, feat: Features, target: tuple[float,float], stable: bool):
+        if self.calib.state!="COLLECT": return
+        if not stable: return
+        fv=GazeModel.feat_vec(feat)
+        self.calib.add(fv, target, feat.quality)
+    def calib_finish(self) -> CalibrationReport | None:
+        if self.calib.state not in ("FIT","COLLECT"): return self.calib.report
+        rep=self.calib.fit_and_report(self.model, self.screen)
+        self.model_ready=True
+        # log
+        row={
+            "ts": _now_iso(),
+            "n_points": rep.n_points,
+            "rmse_px": round(rep.rmse_px or 0.0,3),
+            "rmse_cv_px": round(rep.rmse_cv_px or 0.0,3),
+            "mae_px": round(rep.mae_px or 0.0,3),
+            "rmse_norm": round(rep.rmse_norm or 0.0,6),
+            "mae_norm": round(rep.mae_norm or 0.0,6),
+            "uniformity": round(rep.uniformity,4),
+            "passed": rep.passed(self.gate["min_pts"], self.gate["uniformity"], self.gate["rmse_train"], self.gate["rmse_cv"]),
+            "fps": round(self.last_metrics.fps,2),
+            "latency_ms": round(self.last_metrics.latency_ms,2),
+            "screen_w": self.screen[0],
+            "screen_h": self.screen[1],
+        }
+        try:
+            p=pathlib.Path(self.eval_csv)
+            if not p.exists():
+                p.write_text(",".join(row.keys())+"\n"+",".join(str(row[k]) for k in row.keys())+"\n")
+            else:
+                with p.open("a") as f: f.write(",".join(str(row[k]) for k in row.keys())+"\n")
+        except Exception: pass
+        return rep
+    def gate_ok(self) -> tuple[bool,str]:
+        rep=self.calib.report
+        if rep is None: return False,"ยังไม่คาลิเบรท"
+        reasons=[]
+        if rep.n_points < self.gate["min_pts"]: reasons.append(f"จุดน้อย ({rep.n_points}/{self.gate['min_pts']})")
+        if rep.uniformity < self.gate["uniformity"]: reasons.append(f"uniformity {rep.uniformity:.2f} < {self.gate['uniformity']:.2f}")
+        if (rep.rmse_px or 1e9) > self.gate["rmse_train"]: reasons.append(f"RMSE {rep.rmse_px:.0f}px > {self.gate['rmse_train']:.0f}px")
+        if (rep.rmse_cv_px or 1e9) > self.gate["rmse_cv"]: reasons.append(f"CV {rep.rmse_cv_px:.0f}px > {self.gate['rmse_cv']:.0f}px")
+        ok=len(reasons)==0
+        return ok, ("ผ่าน" if ok else " , ".join(reasons))
+
+# ========================= App State / UI =========================
+class AppState:
+    def __init__(self):
+        self.mirror=False; self.invert_x=False; self.invert_y=False
+        self.use_override=False; self.ov_w=_safe_size()[0]; self.ov_h=_safe_size()[1]
+        self.gain=1.2; self.gamma=1.0; self.deadzone=0.02
+        self.mouse_enable=False; self.dwell_ms=1200; self.dwell_radius=40
+        self.filter_mincutoff=1.0; self.filter_beta=0.01
+        self.comp_enable=True; self.comp_alpha=1.0
+        self.gate_mode="Balanced"
+        self.gate_rmse=45.0; self.gate_cv=55.0; self.gate_uni=0.50; self.gate_pts=9
+        self.calib_points=12; self.calib_dwell_ms=1200
+        self.dev_diag=False
+        self.source = "Webcam"                   # "Webcam" หรือ "ESP32"
+        self.esp32_url = "http://192.168.0.58:81/stream"
+        # runtime
+        self.shared=GazePoint(0.5,0.5)
+        self.mouse_gate=False; self.mouse_reason="ยังไม่คาลิเบรท"
+        self.fps=0.0; self.lat=0.0
+
+if "APP" not in st.session_state:
+    st.session_state["APP"]=AppState()
+APP: AppState = st.session_state["APP"]
+
+# ========================= Video Processor =========================
+class GazeProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.engine=GazeEngine()
+        self.extractor=FeatureExtractor(use_mediapipe=True)
+        self.iris=IrisTracker()
+        self.mouse=MouseController(False, APP.dwell_ms, APP.dwell_radius)
+        self.calib_active=False
+        self.targets=[]; self.idx=0
+        self.hold_start=None; self.pool=[]
+    def _stable(self, feat: Features, x:float, y:float, last:tuple[float,float,float]):
+        lx,ly,lt=last; dt=max(1e-3, _now_perf()-lt)
+        speed=math.hypot(x-lx,y-ly)/dt
+        return (feat.quality>=0.35) and (speed<1.2), speed
+    def recv(self, frame: VideoFrame) -> VideoFrame:
+        img=frame.to_ndarray(format="bgr24")
+        if APP.mirror and cv2 is not None: img=cv2.flip(img,1)
+        # apply config to engine
+        if APP.use_override: self.engine.set_screen(APP.ov_w, APP.ov_h)
+        self.engine.set_shape(APP.gain, APP.gamma, APP.deadzone)
+        self.engine.set_comp(APP.comp_enable, APP.comp_alpha)
+        self.engine.fx.mincutoff=float(APP.filter_mincutoff); self.engine.fx.beta=float(APP.filter_beta)
+        self.engine.fy.mincutoff=float(APP.filter_mincutoff); self.engine.fy.beta=float(APP.filter_beta)
+        self.engine.set_gate(APP.gate_rmse, APP.gate_cv, APP.gate_uni, APP.gate_pts)
+
+        feat=self.extractor.extract(img)
+        # primary mapping
+        if feat is None:
+            gp, met = GazePoint(0.5,0.5), Metrics(self.engine.last_metrics.fps, self.engine.last_metrics.latency_ms, self.engine.last_metrics.model)
+        else:
+            gp, met = self.engine.map_once(feat)
+        x,y = gp.x, gp.y
+        if APP.invert_x: x=1.0-x
+        if APP.invert_y: y=1.0-y
+        APP.shared=GazePoint(x,y); APP.fps=met.fps; APP.lat=met.latency_ms
+
+        # --- Calibration overlay flow
+        if self.calib_active:
+            tx,ty = self.targets[self.idx] if (0<=self.idx<len(self.targets)) else (0.5,0.5)
+            last = getattr(self,"_last_fix",(0.5,0.5,_now_perf()))
+            stable, speed = (False,0.0) if feat is None else self._stable(feat, x,y,last)
+            self._last_fix=(x,y,_now_perf())
+            # draw HUD
+            if cv2 is not None:
+                h,w=img.shape[:2]; gx,gy=int(tx*w),int(ty*h)
+                cv2.circle(img,(gx,gy),18,(0,170,255),2)
+                cv2.putText(img,f"Calib {self.idx+1}/{len(self.targets)} | Q={0 if feat is None else feat.quality:.2f} | v={speed:.2f}",
+                            (24,48), cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,255),2)
+            now=_now_perf()
+            if stable and (feat is not None):
+                if self.hold_start is None: self.hold_start=now; self.pool=[]
+                self.pool.append(GazeModel.feat_vec(feat))
+                elapsed=(now-self.hold_start)*1000.0
+                if cv2 is not None:
+                    h,w=img.shape[:2]; end=int(360*min(1.0, elapsed/APP.calib_dwell_ms))
+                    cv2.ellipse(img,(int(tx*w),int(ty*h)),(22,22),0,0,end,(0,170,255),3)
+                if elapsed>=APP.calib_dwell_ms:
+                    fv=np.mean(np.stack(self.pool,axis=0),axis=0).astype(np.float32) if len(self.pool)>=5 else GazeModel.feat_vec(feat)
+                    self.engine.calib.add(fv, (tx,ty), feat.quality)
+                    self.idx += 1; self.hold_start=None; self.pool=[]
+                    if self.idx>=len(self.targets):
+                        rep=self.engine.calib_finish()
+                        self.calib_active=False
+            else:
+                self.hold_start=None; self.pool=[]
+        # gate & mouse
+        ok, reason = self.engine.gate_ok()
+        APP.mouse_gate, APP.mouse_reason = ok, reason
+        self.mouse.set_enable(APP.mouse_enable)
+        self.mouse.dwell_ms=APP.dwell_ms; self.mouse.dwell_radius_px=APP.dwell_radius
+        self.mouse.update(x,y, do_click=(APP.mouse_enable and ok))
+
+        # overlay gaze + metrics
         if cv2 is not None:
-            h, w = img.shape[:2]
-            gx, gy = int(x * w), int(y * h)
-            cv2.circle(img, (gx, gy), 8, (0, 255, 0), 2)
-            cv2.line(img, (gx-15, gy), (gx+15, gy), (0, 255, 0), 1)
-            cv2.line(img, (gx, gy-15), (gx, gy+15), (0, 255, 0), 1)
-
+            h,w=img.shape[:2]; gx,gy=int(x*w),int(y*h)
+            cv2.circle(img,(gx,gy),8,(0,255,0),2)
+            cv2.line(img,(gx-15,gy),(gx+15,gy),(0,255,0),1)
+            cv2.line(img,(gx,gy-15),(gx,gy+15),(0,255,0),1)
+            info=f"FPS {APP.fps:4.1f} | Latency {APP.lat:4.1f} ms"
+            cv2.putText(img,info,(w-460,28),cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,255),2)
         return VideoFrame.from_ndarray(img, format="bgr24")
 
-# ----------------------------- UI: Sidebar -----------------------------
-def _sidebar_controls():
-    st.sidebar.title("⚙️ Controls")
-
-    mode = st.sidebar.selectbox("Extractor Mode", ["Webcam/MediaPipe", "ESP32 (Orlosky)"], index=0)
-    APP_STATE.extractor_mode = mode
-
+# ========================= UI =========================
+def sidebar():
+    st.sidebar.title("⚙️ Controls (one-file, layered)")
+    sw,sh=_safe_size()
+    # Screen
+    st.sidebar.subheader("🖥️ Screen")
+    APP.use_override=st.sidebar.checkbox("Override screen size", value=APP.use_override)
+    c1,c2=st.sidebar.columns(2)
+    APP.ov_w=int(c1.number_input("Width", min_value=320, max_value=10000, value=int(APP.ov_w)))
+    APP.ov_h=int(c2.number_input("Height", min_value=240, max_value=10000, value=int(APP.ov_h)))
+    st.sidebar.caption(f"OS reports: {sw}×{sh}px")
+    # Shaping
     st.sidebar.subheader("🎛 Shaping")
-    APP_STATE.gain  = float(st.sidebar.slider("Gain", 0.5, 2.5, APP_STATE.gain, 0.05))
-    APP_STATE.gamma = float(st.sidebar.slider("Gamma", 0.5, 2.0, 1.0, 0.05))
-    APP_STATE.deadzone = float(st.sidebar.slider("Deadzone", 0.0, 0.1, 0.02, 0.005))
-
-    st.sidebar.subheader("🖱️ Mouse Control")
-    APP_STATE.mouse_enabled = st.sidebar.toggle(
-        "Enable Mouse Control (pointer follows; click unlocks after calibration PASS)",
-        value=False,
-        help="คลิกจะถูกปลดล็อกอัตโนมัติเมื่อ RMSE/CV/Uniformity ผ่านเกณฑ์"
-    )
-    APP_STATE.dwell_ms = st.sidebar.slider("Dwell Click (ms)", 200, 1500, 700, 50)
-    APP_STATE.dwell_radius = st.sidebar.slider("Dwell Radius (px)", 10, 120, 40, 2)
-
-    st.sidebar.subheader("🪞 Axes / Mirror")
-    APP_STATE.mirror_input = st.sidebar.checkbox("Mirror webcam image", value=False)
-    APP_STATE.invert_x     = st.sidebar.checkbox("Invert predicted X (x → 1−x)", value=False)
-    APP_STATE.invert_y     = st.sidebar.checkbox("Invert predicted Y (y → 1−y)", value=False)
-
-    if mode == "ESP32 (Orlosky)":
-        st.sidebar.subheader("ESP32")
-        APP_STATE.esp32_url = st.sidebar.text_input("Stream URL", value=APP_STATE.esp32_url)
-        col_e1, col_e2, col_e3 = st.sidebar.columns(3)
-        start_esp = col_e1.button("Start")
-        stop_esp  = col_e2.button("Stop")
-        APP_STATE.synthetic_hud = col_e3.toggle("HUD w/o Webcam", value=False)
-        if start_esp:
-            if APP_STATE.esp32_stop is None:
-                APP_STATE.esp32_q = queue.Queue(maxsize=4)
-                APP_STATE.esp32_stop = threading.Event()
-                t = ESP32Reader(APP_STATE.esp32_url, APP_STATE.esp32_q, APP_STATE.esp32_stop)
-                t.start(); st.toast("ESP32 reader started")
-        if stop_esp and APP_STATE.esp32_stop is not None:
-            APP_STATE.esp32_stop.set(); APP_STATE.esp32_stop = None
-            st.toast("ESP32 reader stopped")
-
+    APP.gain=float(st.sidebar.slider("Gain",0.5,2.5,APP.gain,0.05))
+    APP.gamma=float(st.sidebar.slider("Gamma",0.5,2.0,APP.gamma,0.05))
+    APP.deadzone=float(st.sidebar.slider("Deadzone",0.0,0.1,APP.deadzone,0.005))
+    # Mouse
+    st.sidebar.subheader("🖱️ Mouse")
+    APP.mouse_enable=st.sidebar.toggle("Enable Mouse Control", value=APP.mouse_enable)
+    APP.dwell_ms=st.sidebar.slider("Dwell Click (ms)",200,2000,APP.dwell_ms,50)
+    APP.dwell_radius=st.sidebar.slider("Dwell Radius (px)",10,120,APP.dwell_radius,2)
+    # Axes
+    st.sidebar.subheader("🪞 Axes")
+    APP.mirror=st.sidebar.checkbox("Mirror webcam", value=APP.mirror)
+    APP.invert_x=st.sidebar.checkbox("Invert X", value=APP.invert_x)
+    APP.invert_y=st.sidebar.checkbox("Invert Y", value=APP.invert_y)
+    # Filter
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🪄 Smoothing (One Euro)")
-    APP_STATE.filter_mincutoff = float(st.sidebar.slider("mincutoff", 0.05, 3.0, 1.0, 0.05))
-    APP_STATE.filter_beta      = float(st.sidebar.slider("beta", 0.0, 1.0, 0.01, 0.01))
-
-    st.sidebar.subheader("🧭 Calibration")
-    npoints = st.sidebar.selectbox("Points", [9, 12], index=0)
-    APP_STATE.calib_dwell_ms = st.sidebar.slider("Dwell per target (ms)", 400, 1500, APP_STATE.calib_dwell_ms, 50)
-
-    if st.sidebar.button("Start Calibration"):
-        if npoints == 9:
-            # progressive: เริ่มกลาง → กลางแกน → มุม
-            grid = [
-                (0.50, 0.50),
-                (0.30, 0.50), (0.70, 0.50),
-                (0.50, 0.30), (0.50, 0.70),
-                (0.20, 0.20), (0.80, 0.20), (0.20, 0.80), (0.80, 0.80),
-            ]
-        else:
-            grid = [
-                (0.50, 0.50),
-                (0.30, 0.50), (0.70, 0.50),
-                (0.50, 0.30), (0.50, 0.70),
-                (0.15, 0.15), (0.85, 0.15), (0.15, 0.85), (0.85, 0.85),
-                (0.30, 0.30), (0.70, 0.30), (0.50, 0.70),
-            ]
-        # ไม่ shuffle เพื่อให้ model ดีขึ้นเรื่อย ๆ แบบ progressive
-        APP_STATE.calib_targets = grid
-        APP_STATE.calib_idx = 0
-        APP_STATE.calib_overlay_active = True
-        sw, sh = _safe_size()
-        APP_STATE.calib_radius_norm = max(0.012, 40 / max(sw, sh))  # ~40px
-        st.toast("เริ่มคาลิเบรท (Fullscreen video)")
-
-# ----------------------------- Overlay (CSS only for fullscreen video) -----------------------------
-def _render_calibration_overlay(_ctx):
-    """ทำให้วิดีโอเต็มหน้าจอขณะคาลิเบรท (ไม่รีเฟรชเพจ; การวาด/นับทำใน VideoProcessor)"""
-    if APP_STATE.calib_overlay_active:
-        st.session_state["calib_ph"].empty()
-        st.markdown("""
-        <style>
-          section[data-testid="stSidebar"] { display: none !important; }
-          header, footer { display: none !important; }
-          video { position: fixed !important; inset: 0 !important;
-                  width: 100vw !important; height: 100vh !important;
-                  object-fit: cover !important; z-index: 9999 !important; }
-        </style>
-        """, unsafe_allow_html=True)
+    st.sidebar.subheader("🪄 One Euro Filter")
+    APP.filter_mincutoff=float(st.sidebar.slider("mincutoff",0.05,3.0,APP.filter_mincutoff,0.05))
+    APP.filter_beta=float(st.sidebar.slider("beta",0.0,1.0,APP.filter_beta,0.01))
+    # Compensation
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🎯 Compensation")
+    APP.comp_enable=st.sidebar.toggle("Enable compensation", value=APP.comp_enable)
+    APP.comp_alpha=float(st.sidebar.slider("Strength (alpha)",0.0,1.0,APP.comp_alpha,0.05))
+    # Gate
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("✅ Click Gate")
+    mode=st.sidebar.selectbox("Mode",["Strict","Balanced","Lenient"], index=["Strict","Balanced","Lenient"].index(APP.gate_mode))
+    APP.gate_mode=mode
+    if mode=="Strict":
+        APP.gate_rmse=30.0; APP.gate_cv=35.0; APP.gate_uni=0.55; APP.gate_pts=9
+    elif mode=="Balanced":
+        APP.gate_rmse=45.0; APP.gate_cv=55.0; APP.gate_uni=0.50; APP.gate_pts=9
     else:
-        st.session_state["calib_ph"].empty()
+        APP.gate_rmse=60.0; APP.gate_cv=75.0; APP.gate_uni=0.45; APP.gate_pts=9
+    st.sidebar.caption(f"RMSE≤{APP.gate_rmse}px / CV≤{APP.gate_cv}px · U≥{APP.gate_uni}")
+    # Calibration
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🧭 Calibration")
+    APP.calib_points=st.sidebar.selectbox("Points",[9,12], index=1)
+    APP.calib_dwell_ms=st.sidebar.slider("Dwell per target (ms)",400,2000,APP.calib_dwell_ms,50)
+    if st.sidebar.button("Start Calibration"):
+        if APP.calib_points==9:
+            grid=[(0.50,0.50),
+                  (0.30,0.50),(0.70,0.50),
+                  (0.50,0.30),(0.50,0.70),
+                  (0.20,0.20),(0.80,0.20),(0.20,0.80),(0.80,0.80)]
+        else:
+            grid=[(0.50,0.50),
+                  (0.30,0.50),(0.70,0.50),
+                  (0.50,0.30),(0.50,0.70),
+                  (0.15,0.15),(0.85,0.15),(0.15,0.85),(0.85,0.85),
+                  (0.30,0.30),(0.70,0.30),(0.50,0.70)]
+        vp=st.session_state.get("webrtc_ctx")
+        if vp and vp.video_processor:
+            vp.video_processor.engine.calib_start(grid)
+            vp.video_processor.targets=grid
+            vp.video_processor.idx=0
+            vp.video_processor.calib_active=True
+            st.toast("เริ่มคาลิเบรทแล้ว")
 
-# ----------------------------- Main -----------------------------
+    # Dev diag
+    st.sidebar.markdown("---")
+    APP.dev_diag=st.sidebar.toggle("Developer diagnostics", value=APP.dev_diag)
+
 def main():
-    st.set_page_config(page_title="Gaze All-in-One", page_icon="👀", layout="wide")
-    st.title("👀 Gaze All-in-One — Webcam / ESP32 / Calibration Overlay (in-video)")
-    st.caption("หากพรีวิวกล้องไม่ขึ้น ให้อนุญาตสิทธิ์กล้อง และติดตั้ง opencv-python / mediapipe")
+    st.set_page_config(page_title="👀 Gaze One-File (Layered)", layout="wide")
+    st.title("👀 Gaze One-File • Layered Architecture + FSM + Metrics")
+    st.caption("POC ที่ยัง one-file แต่โครงชัด • FPS/Latency overlay • RMSE/MAE logging (CSV) • Gate/Screen Override")
 
-    # sidebar & controls
-    _sidebar_controls()
+    sidebar()
 
-    # WebRTC (ขอ 60fps + 640x480)
-    ctx = webrtc_streamer(
-        key="gaze-stream",
+    ctx=webrtc_streamer(
+        key="gaze",
         mode=WebRtcMode.SENDRECV,
-        media_stream_constraints={
-            "video": {
-                "width": {"ideal": 640},
-                "height": {"ideal": 480},
-                "frameRate": {"ideal": 60, "min": 30},
-            },
-            "audio": False,
-        },
+        media_stream_constraints={"video":{"width":{"ideal":640},"height":{"ideal":480},"frameRate":{"ideal":60,"min":30}},"audio":False},
         async_processing=False,
         video_processor_factory=GazeProcessor,
     )
+    st.session_state["webrtc_ctx"]=ctx
 
-    # fullscreen CSS while calibrating (no refresh)
-    _render_calibration_overlay(ctx)
-
-    # Diagnostics
-    col1, col2, col3 = st.columns(3)
-    mouse_state = "ON (click ✅)" if (APP_STATE.mouse_enabled and APP_STATE.mouse_gate_passed) \
-                  else ("ON (click ⛔)" if APP_STATE.mouse_enabled else "OFF")
-    with col1: st.metric("Mouse", mouse_state)
-    with col2: st.metric("Mode", APP_STATE.extractor_mode)
-    with col3: st.metric("ESP32", "RUNNING" if APP_STATE.esp32_stop is not None else "STOPPED")
+    # Metrics row
+    c1,c2,c3,c4,c5,c6=st.columns(6)
+    with c1: st.metric("Mouse", "ON ✅" if (APP.mouse_enable and APP.mouse_gate) else ("ON ⛔" if APP.mouse_enable else "OFF"))
+    with c2: st.metric("Mode", "Calibrated" if APP.mouse_gate else "Fallback")
+    with c3: st.metric("Gate", "PASS" if APP.mouse_gate else "LOCK")
+    with c4: st.metric("FPS", f"{APP.fps:.1f}")
+    with c5: st.metric("Latency (ms)", f"{APP.lat:.1f}")
+    with c6:
+        sw = APP.ov_w if APP.use_override else _safe_size()[0]
+        sh = APP.ov_h if APP.use_override else _safe_size()[1]
+        st.metric("Screen", f"{sw}×{sh}")
 
     st.markdown("### Diagnostics")
     st.write({
-        "calib_active": APP_STATE.calib_overlay_active,
-        "calib_idx": APP_STATE.calib_idx,
-        "n_targets": len(APP_STATE.calib_targets),
-        "mirror_input": APP_STATE.mirror_input,
-        "invert_x": APP_STATE.invert_x,
-        "invert_y": APP_STATE.invert_y,
-        "gaze": (round(APP_STATE.shared_gaze_x,3), round(APP_STATE.shared_gaze_y,3)),
-        "click_gate": {"passed": APP_STATE.mouse_gate_passed, "reason": APP_STATE.mouse_gate_reason}
+        "gaze": (round(APP.shared.x,3), round(APP.shared.y,3)),
+        "gate_reason": APP.mouse_reason,
+        "mirror": APP.mirror, "invert_x": APP.invert_x, "invert_y": APP.invert_y,
+        "comp": {"enabled": APP.comp_enable, "alpha": APP.comp_alpha},
     })
 
-    if ctx and ctx.video_processor and ctx.video_processor.engine:
-        eng = ctx.video_processor.engine
-        rep = eng.get_calibration_report()
-
-        st.markdown("---")
-        colA, colB, colC, colD = st.columns([1,1,1,2])
-        with colA:
-            if st.button("Start Drift"): eng.drift_start(); st.toast("Drift enabled")
-        with colB:
-            if st.button("Stop Drift"): eng.drift_stop(); st.toast("Drift disabled")
-        with colC:
-            if st.button("Add Drift Sample (current gaze ~ center)"): eng.drift_add(0.5, 0.5)
-        with colD:
-            st.write(eng.get_report())
-
+    # Calibration report + Log viewer
+    if ctx and ctx.video_processor:
+        eng=ctx.video_processor.engine
+        rep=eng.calib.report
         st.subheader("Calibration Report")
         if rep is None:
-            st.info("Model: **Uncalibrated** – คลิกถูกล็อกจนกว่าจะคาลิเบรทผ่านเกณฑ์")
+            st.info("Uncalibrated — คลิกถูกล็อกจนกว่าจะคาลิเบรทผ่านเกณฑ์")
         else:
-            ok, reason = eng.click_gate()
-            chip = "✅ PASS" if ok else "⛔ LOCK"
-            st.markdown(f"- {chip} · RMSE(train): **{rep.rmse_px:.0f}px**, RMSE(CV): **{rep.rmse_cv_px:.0f}px**, uniformity: **{rep.uniformity:.2f}**, points: **{rep.n_points}**")
+            ok, reason = eng.gate_ok()
+            badge = "✅ PASS" if ok else "⛔ LOCK"
+            st.markdown(f"- {badge} · RMSE(train): **{rep.rmse_px:.0f}px**, RMSE(CV): **{rep.rmse_cv_px:.0f}px**, "
+                        f"MAE: **{rep.mae_px:.0f}px**, uniformity: **{rep.uniformity:.2f}**, points: **{rep.n_points}**")
             if not ok: st.caption(f"เหตุผล: {reason}")
 
-        st.subheader("Profile")
-        cS1, cS2 = st.columns([1,1])
-        with cS1:
-            if st.button("Save profile"):
-                ok = eng.save_profile("gaze_profile.json", meta={"ts": time.time()})
-                st.toast("Saved" if ok else "Save failed")
-        with cS2:
-            if st.button("Load profile"):
-                ok = eng.load_profile("gaze_profile.json")
-                st.toast("Loaded" if ok else "Load failed")
+        st.subheader("Evaluation Log (CSV)")
+        p=pathlib.Path(eng.eval_csv)
+        if p.exists() and pd is not None:
+            try:
+                df=pd.read_csv(p)
+                st.dataframe(df, use_container_width=True, hide_index=True)
+                st.download_button("⬇️ Download CSV", data=df.to_csv(index=False).encode("utf-8"),
+                                   file_name="gaze_eval_log.csv", mime="text/csv")
+            except Exception:
+                st.caption("อ่าน CSV ไม่ได้ (เปิดอยู่หรือไฟล์ล็อก?)")
+        else:
+            st.caption("ยังไม่มีบันทึก (ทำคาลิเบรทให้จบก่อน)")
 
-    st.markdown("""
-**ขั้นตอนใช้งาน**
-1) Sidebar → เลือก 9/12 จุด → **Start Calibration** (วิดีโอเต็มจอ)
-2) จ้องจุดจนวงแหวนเต็ม → จะเลื่อนไปจุดถัดไปอัตโนมัติ (3 จุดแรกยอมรับกว้างขึ้น)
-3) ครบทั้งหมด → แสดงผล PASS/LOCK บนวิดีโอ ~2 วินาที
-4) เปิด "Enable Mouse Control" → เมาส์วิ่งตามตาทันที; คลิกได้เมื่อ PASS
-    """)
+    st.markdown("---")
+    st.markdown(
+        """
+**สรุปสถาปัตย์ในไฟล์เดียว**
+- `IrisTracker` แยก logic ตรวจ iris + Kalman (ลด state ซ่อน)
+- `FeatureExtractor` รับผิดชอบ MediaPipe → `Features`
+- `GazeModel` โพลีโนเมียล + compensation (เรียนรู้หลังคาลิเบรต)
+- `CalibratorFSM` ทำ state machine เก็บ → fit → report
+- `GazeEngine` เป็น orchestrator core (map/shape/smooth/metrics/log)
+- `GazeProcessor` เป็นวงลูปเฟรม (UI overlay + mouse + gate)
+        """
+    )
 
 if __name__ == "__main__":
     main()
