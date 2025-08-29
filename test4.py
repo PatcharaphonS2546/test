@@ -67,16 +67,28 @@ def play_sound_file(path: str) -> bool:
     Returns True if a backend accepted the file.
     """
     try:
+        # ใช้ simpleaudio สำหรับ .wav
         if sa and path.lower().endswith((".wav", ".wave")):
             wave_obj = sa.WaveObject.from_wave_file(path)
             wave_obj.play()
             return True
+        # ใช้ pygame สำหรับ .mp3
+        elif path.lower().endswith('.mp3'):
+            try:
+                import pygame
+                pygame.mixer.init()
+                pygame.mixer.music.load(path)
+                pygame.mixer.music.play()
+                return True
+            except Exception as e:
+                print(f"pygame play failed: {e}")
+        # fallback: playsound (อาจ error ได้)
         elif _playsound:
             import threading as _th
             _th.Thread(target=_playsound, args=(path,), daemon=True).start()
             return True
     except Exception as e:
-        print("play_sound failed:", e)
+        print("play_sound_file failed:", e)
     return False
 
 def _inside_rect(nx: float, ny: float, rect) -> bool:

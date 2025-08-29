@@ -16,3 +16,4 @@ cryptography
 pyopenssl
 tornado
 protobuf
+pygame
