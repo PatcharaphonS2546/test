@@ -37,6 +37,16 @@ try:
 except Exception:
     plt = None  # ใช้บันทึกไฟล์ PNG; แนะนำให้ติดตั้ง matplotlib
 
+# --- Optional sound deps for Thai Soundboard ---
+try:
+    import simpleaudio as sa  # best for .wav
+except Exception:
+    sa = None
+try:
+    from playsound import playsound as _playsound  # fallback for .mp3
+except Exception:
+    _playsound = None
+
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
 from av import VideoFrame
 
@@ -50,6 +60,28 @@ def _safe_size() -> Tuple[int, int]:
             pass
     return 1920, 1080
 
+
+
+def play_sound_file(path: str) -> bool:
+    """Play an audio file non-blocking on the server machine.
+    Returns True if a backend accepted the file.
+    """
+    try:
+        if sa and path.lower().endswith((".wav", ".wave")):
+            wave_obj = sa.WaveObject.from_wave_file(path)
+            wave_obj.play()
+            return True
+        elif _playsound:
+            import threading as _th
+            _th.Thread(target=_playsound, args=(path,), daemon=True).start()
+            return True
+    except Exception as e:
+        print("play_sound failed:", e)
+    return False
+
+def _inside_rect(nx: float, ny: float, rect) -> bool:
+    x0, y0, x1, y1 = rect
+    return (x0 <= nx <= x1) and (y0 <= ny <= y1)
 
 # ----------------------------- One Euro Filter -----------------------------
 class OneEuroFilter:
@@ -745,6 +777,23 @@ class AppState:
         self.countdown_secs = 3     # จำนวนวิินาทีก่อนเริ่มคาลิเบรต
         self.countdown_active = False
         self.countdown_end = 0.0
+        # --- Soundboard (2x3 Thai) ---
+        self.soundboard_on = False
+        self.sound_labels = ["สวัสดี", "ใช่", "ไม่ใช่", "ขอบคุณ", "ช่วยด้วย", "ไปห้องน้ำ"]
+        self.sound_files = [
+            "sounds/s1.wav",
+            "sounds/s2.wav",
+            "sounds/s3.wav",
+            "sounds/s4.wav",
+            "sounds/s5.wav",
+            "sounds/s6.wav",
+        ]
+        self.sound_dwell_ms = 3000      # dwell 3s before speaking
+        self.sound_cooldown_ms = 1500   # cooldown to avoid repeats
+        self._sound_current_idx = None
+        self._sound_start = 0.0
+        self._sound_last_play = [-1.0]*6
+
 
 
 if "APP" not in st.session_state:
@@ -907,7 +956,69 @@ class Processor(VideoProcessorBase):
                 cv2.putText(img, f"FPS {APP.ui_fps:4.1f} | Latency {APP.ui_lat:4.1f} ms",
                     (w - 460, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
-            # --- record metrics each frame ---
+            
+            # --- Soundboard overlay (2x3) ---
+            if APP.soundboard_on and (not APP.calib_overlay) and (not APP.countdown_active) and cv2 is not None:
+                rows, cols = 2, 3
+                H, W = img.shape[:2]
+                hover_idx = None
+
+                # draw grid + labels
+                for r in range(rows):
+                    for c in range(cols):
+                        idx = r*cols + c
+                        x0, x1 = c/cols, (c+1)/cols
+                        y0, y1 = r/rows, (r+1)/rows
+                        pt1 = (int(x0*W), int(y0*H))
+                        pt2 = (int(x1*W), int(y1*H))
+                        inside = _inside_rect(APP.gx, APP.gy, (x0, y0, x1, y1))
+                        color = (40, 40, 40); thick = 2
+                        if inside:
+                            color = (0, 200, 255); thick = 4
+                            hover_idx = idx
+                        cv2.rectangle(img, pt1, pt2, color, thick)
+                        label = APP.sound_labels[idx] if idx < len(APP.sound_labels) else f"Button {idx+1}"
+                        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
+                        cx = int((x0 + x1)/2 * W) - tw//2
+                        cy = int((y0 + y1)/2 * H) + th//3
+                        cv2.putText(img, label, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 3, cv2.LINE_AA)
+
+                # dwell logic → play sound
+                now = time.time()
+                if hover_idx is None:
+                    APP._sound_current_idx = None
+                    APP._sound_start = 0.0
+                else:
+                    if APP._sound_current_idx != hover_idx:
+                        APP._sound_current_idx = hover_idx
+                        APP._sound_start = now
+                    elapsed_ms = (now - APP._sound_start) * 1000.0
+
+                    # progress arc at top of the hovered button
+                    c = hover_idx % cols
+                    r = hover_idx // cols
+                    x0, x1 = c/cols, (c+1)/cols
+                    y0 = r/rows
+                    pcx = int((x0 + x1)/2 * W)
+                    pcy = int(y0 * H + 40)
+                    frac = max(0.0, min(1.0, elapsed_ms / float(max(1, APP.sound_dwell_ms))))
+                    cv2.ellipse(img, (pcx, pcy), (28,28), 0, 0, int(360*frac), (0,200,255), 4)
+
+                    last = APP._sound_last_play[hover_idx] if hover_idx < len(APP._sound_last_play) else -1.0
+                    if (elapsed_ms >= APP.sound_dwell_ms) and ((now - last) >= APP.sound_cooldown_ms/1000.0):
+                        path = APP.sound_files[hover_idx] if hover_idx < len(APP.sound_files) else None
+                        if path:
+                            try:
+                                import threading as _th
+                                _th.Thread(target=play_sound_file, args=(path,), daemon=True).start()
+                            except Exception:
+                                pass
+                        if hover_idx < len(APP._sound_last_play):
+                            APP._sound_last_play[hover_idx] = now
+                        # require moving gaze away before repeating same button
+                        APP._sound_current_idx = None
+                        APP._sound_start = 0.0
+# --- record metrics each frame ---
             sw = APP.screen_w if APP.use_screen_override else _safe_size()[0]
             sh = APP.screen_h if APP.use_screen_override else _safe_size()[1]
             pred_px = (int(APP.gx*sw), int(APP.gy*sh))
@@ -949,6 +1060,17 @@ def sidebar():
     st.sidebar.subheader("Optional: Degrees")
     APP.deg_per_px = float(st.sidebar.number_input("deg per px (คูณเพื่อแปลงค่า px→deg)", min_value=0.0, max_value=1.0, value=float(APP.deg_per_px), step=0.001, format="%.3f"))
     st.sidebar.caption("ถ้าไม่ทราบ ปล่อยไว้ 0.000 ได้ (จะไม่สร้างกราฟหน่วยองศา)")
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🔊 Thai Soundboard (2×3)")
+    APP.soundboard_on = st.sidebar.toggle("Enable gaze soundboard overlay", value=APP.soundboard_on)
+    APP.sound_dwell_ms = int(st.sidebar.slider("Dwell to speak (ms)", 1000, 5000, APP.sound_dwell_ms, 250))
+    APP.sound_cooldown_ms = int(st.sidebar.slider("Cooldown (ms)", 500, 5000, APP.sound_cooldown_ms, 250))
+    for i in range(6):
+        c1, c2 = st.sidebar.columns([1,2])
+        APP.sound_labels[i] = c1.text_input(f"Label {i+1}", APP.sound_labels[i], key=f"sb_lbl_{i}")
+        APP.sound_files[i] = c2.text_input(f"File {i+1}", APP.sound_files[i], key=f"sb_file_{i}")
+    st.sidebar.caption("หมายเหตุ: เสียงจะออกทางเครื่องที่รันแอป Streamlit (ฝั่งเซิร์ฟเวอร์)")
+
 
     if APP.mode.startswith("ESP32"):
         st.sidebar.subheader("ESP32-CAM")
