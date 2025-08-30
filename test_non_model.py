@@ -108,7 +108,7 @@ def _inside_rect(nx: float, ny: float, rect) -> bool:
 
 # ----------------------------- One Euro Filter -----------------------------
 class OneEuroFilter:
-    def __init__(self, freq=120.0, mincutoff=1.0, beta=0.01, dcutoff=1.0):
+    def __init__(self, freq=60.0, mincutoff=0.5, beta=0.005, dcutoff=1.0):
         self.freq = float(freq)
         self.mincutoff = float(mincutoff)
         self.beta = float(beta)
@@ -144,7 +144,7 @@ class OneEuroFilter:
 
 # ----------------------------- Mouse (Pointer only) -----------------------------
 class MouseController:
-    def __init__(self, enable: bool = False, rate_limit_ms: int = 33):
+    def __init__(self, enable: bool = False, rate_limit_ms: int = 10):
         self.enable = bool(enable)
         self.rate_ms = int(rate_limit_ms)
         self.sw, self.sh = _safe_size()
@@ -199,9 +199,12 @@ class MetricsRecorder:
         if not self.samples or pd is None:
             return None
         rows = []
-        for s in self.samples:
-            err = _dist_px(s.pred_px, s.target_px) if (s.pred_px and s.target_px) else None
-            rows.append({
+        # ใช้ numpy array สำหรับ batch calculation
+        pred_arr = np.array([s.pred_px if s.pred_px is not None else (np.nan, np.nan) for s in self.samples])
+        tgt_arr = np.array([s.target_px if s.target_px is not None else (np.nan, np.nan) for s in self.samples])
+        err_arr = np.linalg.norm(pred_arr - tgt_arr, axis=1)
+        rows = [
+            {
                 "ts_ms": s.ts_ms,
                 "latency_ms": s.latency_ms,
                 "pred_x": None if s.pred_px is None else s.pred_px[0],
@@ -209,8 +212,10 @@ class MetricsRecorder:
                 "tgt_x": None if s.target_px is None else s.target_px[0],
                 "tgt_y": None if s.target_px is None else s.target_px[1],
                 "point_id": s.point_id,
-                "err_px": err,
-            })
+                "err_px": err_arr[i] if not np.isnan(err_arr[i]) else None,
+            }
+            for i, s in enumerate(self.samples)
+        ]
         return pd.DataFrame(rows)
 
     def summarize(self):
@@ -222,6 +227,7 @@ class MetricsRecorder:
                 pd.DataFrame({"metric":["Latency(ms)","Jitter(px)","MAE(px)","RMSE(px)"], "value":[np.nan]*4}),
                 pd.DataFrame(columns=["point_id","jitter_px","mae_px","rmse_px","n"])
             )
+        # คำนวณ summary เฉพาะเมื่อถูกเรียก ไม่ต้องคำนวณทุก frame
         df_t = df.dropna(subset=["tgt_x","tgt_y","err_px"])
         lat_mean = float(np.nanmean(df["latency_ms"])) if "latency_ms" in df and len(df) else np.nan
         if df_t.empty:
@@ -229,20 +235,35 @@ class MetricsRecorder:
                 pd.DataFrame({"metric":["Latency(ms)","Jitter(px)","MAE(px)","RMSE(px)"], "value":[lat_mean,np.nan,np.nan,np.nan]}),
                 pd.DataFrame(columns=["point_id","jitter_px","mae_px","rmse_px","n"])
             )
-        mae = float(np.mean(df_t["err_px"]))
-        rmse = float(np.sqrt(np.mean(np.square(df_t["err_px"]))))
-        jitter = float(np.std(df_t["err_px"]))
+        # ใช้ numpy สำหรับ batch calculation
+        err_px = df_t["err_px"].values
+        mae = float(np.mean(err_px))
+        rmse = float(np.sqrt(np.mean(np.square(err_px))))
+        jitter = float(np.std(err_px))
         df_global = pd.DataFrame({
             "metric": ["Latency(ms)","Jitter(px)","MAE(px)","RMSE(px)"],
             "value":  [lat_mean,      jitter,       mae,       rmse]
         })
-        g = df_t.groupby("point_id")["err_px"]
+        # groupby point_id แบบ numpy
+        point_ids = df_t["point_id"].values.astype(int)
+        unique_ids = np.unique(point_ids)
+        jitter_px = []
+        mae_px = []
+        rmse_px = []
+        n = []
+        for pid in unique_ids:
+            mask = point_ids == pid
+            vals = err_px[mask]
+            jitter_px.append(float(np.std(vals)))
+            mae_px.append(float(np.mean(vals)))
+            rmse_px.append(float(np.sqrt(np.mean(np.square(vals)))))
+            n.append(int(np.sum(mask)))
         df_points = pd.DataFrame({
-            "point_id": g.count().index.astype(int),
-            "jitter_px": g.std().values,
-            "mae_px": g.mean().values,
-            "rmse_px": np.sqrt(g.apply(lambda s: np.mean(np.square(s))).values),
-            "n": g.count().values
+            "point_id": unique_ids,
+            "jitter_px": jitter_px,
+            "mae_px": mae_px,
+            "rmse_px": rmse_px,
+            "n": n
         }).sort_values("point_id").reset_index(drop=True)
         return df_global, df_points
 
@@ -350,10 +371,26 @@ class MetricsRecorder:
         return saved
 
 
+
 # ใช้ MetricsRecorder ตัวเดียวที่อยู่ใน session_state เสมอ
 if "METRICS" not in st.session_state:
     st.session_state["METRICS"] = MetricsRecorder()
 METRICS: MetricsRecorder = st.session_state["METRICS"]
+
+# --- Sidebar: Save/Analyze Buttons ---
+st.sidebar.markdown("---")
+if st.sidebar.button("💾 บันทึกเมตริกเป็น CSV"):
+    try:
+        p1, p2 = METRICS.save_csv(prefix="exports/metrics")
+        st.sidebar.success(f"บันทึกไฟล์ CSV แล้ว: {p1}, {p2}")
+    except Exception as e:
+        st.sidebar.error(f"บันทึก CSV ไม่สำเร็จ: {e}")
+if st.sidebar.button("📊 บันทึกกราฟเป็น PNG"):
+    try:
+        paths = METRICS.export_webcam_charts(export_dir="exports")
+        st.sidebar.success(f"บันทึกกราฟ PNG แล้ว: {' ,'.join(paths)}")
+    except Exception as e:
+        st.sidebar.error(f"บันทึกกราฟ PNG ไม่สำเร็จ: {e}")
 
 # ----------------------------- CalibrationReport -----------------------------
 class CalibrationReport:
@@ -383,8 +420,8 @@ class Session:
         self.last_quality: float = 0.0
 
         # smoothing & perf
-        self.smooth_x = OneEuroFilter(freq=120.0, mincutoff=1.3, beta=0.02, dcutoff=1.2)
-        self.smooth_y = OneEuroFilter(freq=120.0, mincutoff=1.3, beta=0.02, dcutoff=1.2)
+        self.smooth_x = OneEuroFilter(freq=60.0, mincutoff=0.5, beta=0.005, dcutoff=1.2)
+        self.smooth_y = OneEuroFilter(freq=60.0, mincutoff=0.5, beta=0.005, dcutoff=1.2)
         self.fps_hist: list[float] = []
         self.t_prev: Optional[float] = None
 
@@ -406,7 +443,13 @@ class FeatureExtractor:
     def __init__(self, use_mediapipe: bool = True):
         self.use_mediapipe = use_mediapipe and (mp is not None) and (cv2 is not None)
         self.face_landmarks = None
-        if self.use_mediapipe:
+        self.mesh = None
+        self._initialized = False
+        self.earL_base = 0.26
+        self.earR_base = 0.26
+
+    def _ensure_mesh(self):
+        if not self._initialized and self.use_mediapipe:
             self.mp_face = mp.solutions.face_mesh
             self.mesh = self.mp_face.FaceMesh(
                 static_image_mode=False,
@@ -415,11 +458,7 @@ class FeatureExtractor:
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
-        else:
-            self.mesh = None
-        # baselines
-        self.earL_base = None
-        self.earR_base = None
+            self._initialized = True
 
     def close(self):
         if self.mesh is not None:
@@ -462,8 +501,12 @@ class FeatureExtractor:
         if frame_bgr is None:
             return _fallback(0.2, True)
 
-        if not self.use_mediapipe or self.mesh is None:
-            # ไม่มี mediapipe → คืน fallback ชัดเจน (อย่า return None)
+        # ✅ สร้าง FaceMesh ให้เรียบร้อยก่อนใช้
+        if self.use_mediapipe:
+            self._ensure_mesh()
+
+        # ถ้ายังไม่มี mediapipe หรือ mesh สร้างไม่สำเร็จ → fallback
+        if (not self.use_mediapipe) or (self.mesh is None):
             return _fallback(0.1, False)
 
         h, w = frame_bgr.shape[:2]
@@ -479,7 +522,7 @@ class FeatureExtractor:
         lmk = lm.landmark
         pts = [(p.x * w, p.y * h, p.z) for p in lmk]
 
-        # --- head pose (แบบคร่าวๆจาก mediapipe index) ---
+        # --- head pose (คร่าว ๆ จาก landmark index) ---
         dx = lmk[263].x - lmk[33].x
         dy = lmk[263].y - lmk[33].y
         yaw = math.degrees(math.atan2(dy, dx))
@@ -498,45 +541,46 @@ class FeatureExtractor:
         earR = r_box[6] if r_box else None
         eye_open = bool((earL or 0.0) > 0.20 or (earR or 0.0) > 0.20)
 
-        # confidence ของแต่ละตา: blend จาก EAR และขนาดกล่อง (เชิงประจักษ์)
+        # --- confidence ของแต่ละตา: blend จาก EAR และขนาดกล่อง (เชิงประจักษ์) ---
         def _eye_conf(ear, base, box, iris_ok):
             if (ear is None) or (box is None) or (not iris_ok):
                 return 0.0
-            # bootstrap baseline จากค่าเปิดตาในช่วงแรกๆ
+            # bootstrap baseline จากค่าเปิดตาในช่วงแรก ๆ
             if base is None:
                 base = 0.26
-            ratio = max(0.0, min(1.4, ear / max(1e-6, 0.8*base)))
+            ratio = max(0.0, min(1.4, ear / max(1e-6, 0.8 * base)))
             _, _, _, _, bw, bh, _ = box
-            area_norm = (bw*bh) / max(1.0, (w*h))
+            area_norm  = (bw * bh) / max(1.0, (w * h))
             area_boost = min(1.0, area_norm / 0.02)
-            return max(0.0, min(1.0, 0.7*ratio + 0.3*area_boost))
+            return max(0.0, min(1.0, 0.7 * ratio + 0.3 * area_boost))
 
+        # ✅ เรียกแบบ local function (เดิมที่พังคือ self._eye_conf)
         cL = _eye_conf(earL, self.earL_base, l_box, l_iris is not None)
         cR = _eye_conf(earR, self.earR_base, r_box, r_iris is not None)
 
-        # update baseline แบบ EMA
+        # --- update baseline แบบ EMA ---
         for ear, attr in [(earL, "earL_base"), (earR, "earR_base")]:
             if ear is not None:
                 cur = getattr(self, attr)
-                setattr(self, attr, 0.9*cur + 0.1*ear if cur is not None else ear)
+                setattr(self, attr, 0.9 * cur + 0.1 * ear if cur is not None else ear)
 
-        # combine ex/ey (ถ่วงน้ำหนักด้วยความเชื่อมั่นของตา)
+        # --- combine ex/ey (ถ่วงน้ำหนักด้วยความเชื่อมั่นของตา) ---
         if (cL + cR) <= 1e-6:
             ex, ey = 0.5, 0.5
         else:
-            ex = float((l_n[0]*cL + r_n[0]*cR) / (cL + cR))
-            ey = float((l_n[1]*cL + r_n[1]*cR) / (cL + cR))
+            ex = float((l_n[0] * cL + r_n[0] * cR) / (cL + cR))
+            ey = float((l_n[1] * cL + r_n[1] * cR) / (cL + cR))
 
         # ศูนย์กลางหน้า (เผื่อใช้)
         face_ids = [1, 9, 152, 33, 263]
         fxs = [pts[i][0] for i in face_ids if i < len(pts)]
         fys = [pts[i][1] for i in face_ids if i < len(pts)]
-        fcx = float(sum(fxs)/len(fxs)/max(1, w)) if fxs else 0.5
-        fcy = float(sum(fys)/len(fys)/max(1, h)) if fys else 0.5
+        fcx = float(sum(fxs) / len(fxs) / max(1, w)) if fxs else 0.5
+        fcy = float(sum(fys) / len(fys) / max(1, h)) if fys else 0.5
 
         # คุณภาพรวม: max(conf) * margin (กันหลุดมุม)
-        margin = min(ex, 1-ex, ey, 1-ey)
-        quality = max(cL, cR) * (0.6 + 0.4*max(0.0, min(1.0, margin*2)))
+        margin = min(ex, 1 - ex, ey, 1 - ey)
+        quality = max(cL, cR) * (0.6 + 0.4 * max(0.0, min(1.0, margin * 2)))
 
         return dict(
             eye_cx_norm=ex, eye_cy_norm=ey,
@@ -629,9 +673,10 @@ class GazeEngine:
 
     # ------- internals -------
     def _apply_pose_comp(self, ex, ey, yaw, pitch):
-        # ชดเชยทิศทางศีรษะให้ ex/ey (linear scale + clamp)
-        offx = self.k_yaw   * (yaw   / self.c_yaw)
-        offy = self.k_pitch * (-pitch / self.c_pitch)
+        # Improved: use tanh for smooth limiting, scale by calibration quality
+        q = max(0.0, min(1.0, self.sess.last_quality if hasattr(self.sess, 'last_quality') else 1.0))
+        offx = self.k_yaw * math.tanh(yaw / self.c_yaw) * q
+        offy = self.k_pitch * math.tanh(-pitch / self.c_pitch) * q
         ex = 0.5 + (ex - 0.5) + offx + self.bias_x
         ey = 0.5 + (ey - 0.5) + offy + self.bias_y
         return float(min(1.0, max(0.0, ex))), float(min(1.0, max(0.0, ey)))
@@ -652,6 +697,13 @@ class GazeEngine:
         x = 0.5 + (x - 0.5) * self.gain
         y = 0.5 + (y - 0.5) * self.gain
 
+        # ✅ per-axis gamma (เพิ่ม)
+        if getattr(self, "gamma_x", 1.0) != 1.0:
+            x = signed_gamma(x, self.gamma_x)
+        if getattr(self, "gamma_y", 1.0) != 1.0:
+            y = signed_gamma(y, self.gamma_y)
+
+        # (คง global gamma เดิมไว้ถ้าต้องการ)
         if self.gamma != 1.0:
             def _gm(v, g):
                 s = (v - 0.5); sign = 1.0 if s >= 0 else -1.0
@@ -689,50 +741,55 @@ class GazeEngine:
             # fallback mapping ก่อนคาลิเบรต
             px = 0.5 + (ex - 0.5) * 1.6
             py = 0.5 + (ey - 0.5) * 1.4
+        
+        py = 0.5 + (py - 0.5) * 1.15  # ลอง 1.10–1.25
 
         return np.array([clamp01(px), clamp01(py)], dtype=np.float32)
 
     def process_frame(self, frame_bgr):
-        t0 = time.time()
-        feat = self.ext.extract(frame_bgr)
-
-        if feat is None:
-            fv = np.array([0.5, 0.5, 0.0, 0.0], dtype=np.float32); q = 0.2
-        else:
-            fv = np.array([
-                float(feat.get("eye_cx_norm", 0.5)),
-                float(feat.get("eye_cy_norm", 0.5)),
-                float(feat.get("yaw", 0.0)),
-                float(feat.get("pitch", 0.0)),
-            ], dtype=np.float32)
-            q = float(feat.get("quality", 0.5))
-
-        self.sess.last_feat = fv
-        self.sess.last_quality = q
-
-        pred = self._map(fv)
-        x, y = self._shape(float(pred[0]), float(pred[1]), q)
-
-        # metrics
-        t1 = time.time()
-        if self.sess.t_prev is not None:
-            dt = t1 - self.sess.t_prev
-            if dt > 0:
-                self.sess.fps_hist.append(1.0 / dt)
-                if len(self.sess.fps_hist) > 90:
-                    self.sess.fps_hist = self.sess.fps_hist[-90:]
-        self.sess.t_prev = t1
-        fps = float(np.mean(self.sess.fps_hist)) if self.sess.fps_hist else 0.0
-        latency_ms = float((t1 - t0) * 1000.0)
-        self.sess.metrics = {"fps": fps, "latency_ms": latency_ms}
-        return x, y
+        try:
+            t0 = time.time()
+            feat = self.ext.extract(frame_bgr)
+            if feat is None or feat.get("quality", 0.0) < 0.01:
+                # Robust fallback: pointer at center
+                fv = np.array([0.5, 0.5, 0.0, 0.0], dtype=np.float32); q = 0.0
+            else:
+                fv = np.array([
+                    float(feat.get("eye_cx_norm", 0.5)),
+                    float(feat.get("eye_cy_norm", 0.5)),
+                    float(feat.get("yaw", 0.0)),
+                    float(feat.get("pitch", 0.0)),
+                ], dtype=np.float32)
+                q = float(feat.get("quality", 0.5))
+            self.sess.last_feat = fv
+            self.sess.last_quality = q
+            pred = self._map(fv)
+            x, y = self._shape(float(pred[0]), float(pred[1]), q)
+            t1 = time.time()
+            if self.sess.t_prev is not None:
+                dt = t1 - self.sess.t_prev
+                if dt > 0:
+                    self.sess.fps_hist.append(1.0 / dt)
+                    if len(self.sess.fps_hist) > 90:
+                        self.sess.fps_hist = self.sess.fps_hist[-90:]
+            self.sess.t_prev = t1
+            fps = float(np.mean(self.sess.fps_hist)) if self.sess.fps_hist else 0.0
+            latency_ms = float((t1 - t0) * 1000.0)
+            self.sess.metrics = {"fps": fps, "latency_ms": latency_ms}
+            return x, y
+        except Exception:
+            # Robust fallback: pointer at center
+            self.sess.last_feat = np.array([0.5, 0.5, 0.0, 0.0], dtype=np.float32)
+            self.sess.last_quality = 0.0
+            self.sess.metrics = {"fps": 0.0, "latency_ms": 0.0}
+            return 0.5, 0.5
 
     # ---------- Calibration ----------
     def calibration_add(self, sx, sy):
         if self.sess.last_feat is None or len(self.sess.last_feat) < 4:
             return False
-        # เก็บเฉพาะเฟรมที่คุณภาพโอเค
-        if self.sess.last_quality < 0.15:
+        # PATCH: lower calibration quality threshold
+        if self.sess.last_quality < 0.08:
             return False
         fv = [float(v) for v in self.sess.last_feat[:4]]
         self.sess.calib_features.append(fv)
@@ -752,9 +809,9 @@ class GazeEngine:
         # ridge regression (เล็กน้อยกันโอเวอร์ฟิต) และ weighting ด้วยคุณภาพ (ถ้ามี)
         W = np.ones((n, 1), dtype=np.float32)  # จะอัปเกรดเป็นคุณภาพได้ ถ้าบันทึกไว้รายจุด
         X_aug = np.hstack([X, np.ones((n, 1), dtype=np.float32)])  # (n,5)
-        lam = 1e-3
-        A = np.linalg.solve(X_aug.T @ (W * X_aug) + lam * np.eye(5, dtype=np.float32),
-                            X_aug.T @ (W * Y))  # (5,2)
+        lam_xy, lam_pose, lam_bias = 1e-3, 5e-2, 1e-6   # โทษ pose แรงกว่า
+        R = np.diag([lam_xy, lam_xy, lam_pose, lam_pose, lam_bias]).astype(np.float32)
+        A = np.linalg.solve(X_aug.T @ (W * X_aug) + R, X_aug.T @ (W * Y))
         self.sess.affine = A
         self.sess.model_ready = True
 
@@ -775,7 +832,7 @@ class GazeEngine:
             Xb, Yb = X_aug[test],  Y[test]
             if len(Xa) < 5 or len(Xb) == 0:  # กันเคสจุดน้อยมาก
                 continue
-            Ak = np.linalg.solve(Xa.T @ Xa + lam * np.eye(5, dtype=np.float32),
+            Ak = np.linalg.solve(Xa.T @ Xa + lam_xy * np.eye(5, dtype=np.float32),
                                  Xa.T @ Ya)
             Ybk = Xb @ Ak
             dx = (Ybk[:, 0] - Yb[:, 0]) * self.sw
@@ -848,7 +905,8 @@ class AppState:
         self.mouse_enabled = False
         # calibration
         self.calib_overlay = False
-        self.targets: List[Tuple[float,float]] = []
+    # PATCH: increase calibration points to 16 (4x4 grid)
+        self.targets: List[Tuple[float,float]] = [(x/3, y/3) for y in range(4) for x in range(4)]
         self.idx = 0
         self.dwell_ms = 1000
         self.radius_norm = 0.02
@@ -866,12 +924,12 @@ class AppState:
         self.soundboard_on = False
         self.sound_labels = ["สวัสดี", "ใช่", "ไม่ใช่", "ขอบคุณ", "ช่วยด้วย", "ไปห้องน้ำ"]
         self.sound_files = [
-            "sounds/s1.wav",
-            "sounds/s2.wav",
-            "sounds/s3.wav",
-            "sounds/s4.wav",
-            "sounds/s5.wav",
-            "sounds/s6.wav",
+            "C:/sound/back.mp3",
+            "C:/sound/head.mp3",
+            "C:/sound/Hungry.mp3",
+            "C:/sound/snack.mp3",
+            "C:/sound/stoma.mp3",
+            "C:/sound/Thirsty.mp3",
         ]
         self.sound_icons = [
             "C:/icon/question.png",
@@ -943,10 +1001,13 @@ class Processor(VideoProcessorBase):
 
             # process per frame
             if APP.mode == "Webcam/MediaPipe":
-                x, y = self.engine.process_frame_new(img)
-                # clamp ค่า x, y ให้อยู่ในช่วง 0.0 - 1.0
-                x = max(0.0, min(1.0, x))
-                y = max(0.0, min(1.0, y))
+                try:
+                    x, y = self.engine.process_frame_new(img)
+                    x = max(0.0, min(1.0, x))
+                    y = max(0.0, min(1.0, y))
+                except Exception:
+                    # Robust fallback: pointer at center
+                    x, y = 0.5, 0.5
             else:
                 x, y = APP.gx, APP.gy
 
@@ -995,36 +1056,50 @@ class Processor(VideoProcessorBase):
                 tx, ty = APP.targets[APP.idx] if (0 <= APP.idx < len(APP.targets)) else (0.5, 0.5)
                 h, w = img.shape[:2]
                 gx_i, gy_i = int(tx*w), int(ty*h)
-                cv2.circle(img, (gx_i, gy_i), 18, (0,170,255), 2)
+                # Modern overlay: rounded rectangle, larger font, modern color
+                overlay = img.copy()
+                cv2.rectangle(overlay, (gx_i-32, gy_i-32), (gx_i+32, gy_i+32), (0,170,255), -1)
+                cv2.addWeighted(overlay, 0.25, img, 0.75, 0, img)
+                cv2.circle(img, (gx_i, gy_i), 22, (0,170,255), 3)
 
                 now = time.time()
                 if self.engine.sess.last_feat is not None:
                     if self.calib_hold_start is None:
                         self.calib_hold_start = now; self.pool = []
-                    self.pool.append(self.engine.sess.last_feat.copy())
+                    feat = self.engine.sess.last_feat.copy()
+                    quality = self.engine.sess.last_quality
+                    eye_open = True
+                    if quality > 0.08 and eye_open:
+                        self.pool.append(feat)
                     elapsed = (now - self.calib_hold_start)*1000.0
                 else:
                     self.calib_hold_start = None; self.pool = []; elapsed = 0.0
                 frac = max(0.0, min(1.0, elapsed / float(max(1, APP.dwell_ms))))
                 end_angle = int(360 * frac)
-                cv2.ellipse(img, (gx_i, gy_i), (22, 22), 0, 0, end_angle, (0,170,255), 3)
-                cv2.putText(img, f"Calibration {APP.idx+1}/{len(APP.targets)}",
-                            (24,48), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+                cv2.ellipse(img, (gx_i, gy_i), (28, 28), 0, 0, end_angle, (0,255,180), 5)
+                cv2.putText(img, f"คาลิเบรตจุดที่ {APP.idx+1}/{len(APP.targets)}",
+                            (24,48), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255,255,255), 3)
+                cv2.putText(img, "กรุณาตั้งหัวตรงและมองจุดเป้าหมาย",
+                            (24,90), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,255), 2)
 
+                # ถัวเฉลี่ย sample หลายเฟรมก่อนบันทึก calibration
                 if frac >= 1.0 and 0 <= APP.idx < len(APP.targets):
                     if len(self.pool) >= 5:
-                        self.engine.sess.last_feat = np.mean(np.stack(self.pool, axis=0), axis=0).astype(np.float32)
+                        avg_feat = np.mean(np.stack(self.pool, axis=0), axis=0).astype(np.float32)
+                        self.engine.sess.last_feat = avg_feat
+                    else:
+                        self.engine.sess.last_feat = self.engine.sess.last_feat.copy()
                     self.engine.calibration_add(tx, ty)
                     APP.idx += 1; self.calib_hold_start = None; self.pool = []
                     if APP.idx >= len(APP.targets):
                         rep = self.engine.calibration_finish()
                         APP.calib_overlay = False
-                        txt = ("Calibration OK · "
+                        txt = ("✅ Calibration สำเร็จ · "
                                f"RMSE={rep.get('rmse_px',0):.0f}px · "
                                f"CV={rep.get('rmse_cv_px',0):.0f}px · "
                                f"U={rep.get('uniformity',0):.2f}")
-                        cv2.rectangle(img, (10,10), (10+900, 10+40), (0,0,0), -1)
-                        cv2.putText(img, txt, (18,38), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,230,255), 2)
+                        cv2.rectangle(img, (10,10), (10+900, 10+50), (0,0,0), -1)
+                        cv2.putText(img, txt, (18,48), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,230,255), 3)
 
             # Mouse pointer only
             self.mouse.set_enable(APP.mouse_enabled)
@@ -1094,15 +1169,16 @@ class Processor(VideoProcessorBase):
                                 icon = cv2.resize(raw_icon, (icon_w, icon_h))
                                 self._icon_cache[cache_key] = icon
                         if icon is not None:
-                            # ถ้าเป็น PNG มี alpha channel
-                            if icon.shape[2] == 4:
-                                alpha = icon[:,:,3] / 255.0
-                                for c in range(3):
-                                    img[cy:cy+icon_h, cx:cx+icon_w, c] = (
-                                        alpha * icon[:,:,c] + (1-alpha) * img[cy:cy+icon_h, cx:cx+icon_w, c]
-                                    )
-                            else:
-                                img[cy:cy+icon_h, cx:cx+icon_w] = icon
+                            if cy+icon_h <= img.shape[0] and cx+icon_w <= img.shape[1]:
+                                # ถ้าเป็น PNG มี alpha channel
+                                if icon.shape[2] == 4:
+                                    alpha = icon[:,:,3] / 255.0
+                                    for c in range(3):
+                                        img[cy:cy+icon_h, cx:cx+icon_w, c] = (
+                                            alpha * icon[:,:,c] + (1-alpha) * img[cy:cy+icon_h, cx:cx+icon_w, c]
+                                        )
+                                else:
+                                    img[cy:cy+icon_h, cx:cx+icon_w] = icon
                         else:
                             label = APP.sound_labels[idx] if idx < len(APP.sound_labels) else f"Button {idx+1}"
                             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
@@ -1170,12 +1246,15 @@ class Processor(VideoProcessorBase):
 def sidebar():
     # --- Compensation controls ---
     st.sidebar.subheader("🎯 Compensation (yaw/pitch)")
+    st.sidebar.caption("ปรับค่าชดเชยการหมุนศีรษะ (yaw/pitch) เพื่อให้ตำแหน่ง pointer แม่นยำขึ้น")
     APP.k_yaw   = float(st.sidebar.slider("k_yaw",   0.0, 1.0, APP.k_yaw,   0.01))
     APP.c_yaw   = float(st.sidebar.slider("c_yaw",   0.0, 0.5, APP.c_yaw,   0.01))
     APP.k_pitch = float(st.sidebar.slider("k_pitch", 0.0, 1.0, APP.k_pitch, 0.01))
     APP.c_pitch = float(st.sidebar.slider("c_pitch", 0.0, 0.5, APP.c_pitch, 0.01))
+    st.sidebar.caption("k_yaw: ปรับความไวต่อการหมุนศีรษะซ้าย-ขวา | c_yaw: ปรับค่าชดเชยเพิ่มเติมสำหรับ yaw | k_pitch: ปรับความไวต่อการก้ม-เงยศีรษะ | c_pitch: ปรับค่าชดเชยเพิ่มเติมสำหรับ pitch")
 
     st.sidebar.subheader("🧮 Bias & Auto-Gain")
+    st.sidebar.caption("ตั้งค่าการชดเชยตำแหน่ง (Bias) และปรับความไวอัตโนมัติ (Auto-Gain)")
     c1, c2, c3 = st.sidebar.columns(3)
     if c1.button("Set Center Bias"):
         APP.bias_x = 0.9*APP.bias_x + 0.1*(0.5 - float(APP.gx))
@@ -1184,34 +1263,46 @@ def sidebar():
     if c2.button("Reset Auto-Gain"):
         APP.autogain_reset = True
     APP.autogain_freeze = c3.toggle("Freeze Auto-Gain", value=APP.autogain_freeze)
+    st.sidebar.caption("Set Center Bias: ตั้งค่าชดเชยตำแหน่งให้อยู่ตรงกลางหน้าจอ | Reset Auto-Gain: รีเซ็ตการปรับความไวอัตโนมัติ | Freeze Auto-Gain: หยุดการปรับความไวอัตโนมัติชั่วคราว")
 
     st.sidebar.subheader("📈 Shaping (per-axis)")
+    st.sidebar.caption("ปรับรูปแบบการตอบสนองของ pointer ในแต่ละแกน")
     cols = st.sidebar.columns(2)
     APP.gamma_x = float(cols[0].slider("Gamma X", 0.5, 2.0, APP.gamma_x, 0.05))
     APP.gamma_y = float(cols[1].slider("Gamma Y", 0.5, 2.0, APP.gamma_y, 0.05))
+    st.sidebar.caption("Gamma X: ปรับความโค้งของการตอบสนองแกน X | Gamma Y: ปรับความโค้งของการตอบสนองแกน Y")
     APP.saccade_aware = st.sidebar.toggle("Saccade-aware smoothing", value=APP.saccade_aware)
+    st.sidebar.caption("เปิด/ปิดการลดความสั่น pointer เมื่อมีการกระตุกตา (Saccade)")
 
     st.sidebar.title("⚙️ Controls")
+    st.sidebar.caption("ควบคุมโหมดการทำงานและการใช้เมาส์")
     APP.mode = st.sidebar.selectbox("Mode", ["Webcam/MediaPipe"], index=0)
     APP.mouse_enabled = st.sidebar.toggle("Enable Mouse Control (pointer only — no click)", value=APP.mouse_enabled)
+    st.sidebar.caption("Mode: เลือกโหมดการใช้งาน (ปัจจุบันรองรับเฉพาะ Webcam/MediaPipe) | Enable Mouse Control: เปิด/ปิดการควบคุมเมาส์ด้วยสายตา (เฉพาะ pointer ไม่รวมคลิก)")
 
     st.sidebar.subheader("🖥️ Display / Screen")
+    st.sidebar.caption("ตั้งค่าขนาดหน้าจอสำหรับการคำนวณตำแหน่ง pointer")
     APP.use_screen_override = st.sidebar.checkbox("Override screen size (px)", value=APP.use_screen_override)
     colsw, colsh = st.sidebar.columns(2)
     APP.screen_w = int(colsw.number_input("Width", min_value=320, max_value=10000, value=int(APP.screen_w)))
     APP.screen_h = int(colsh.number_input("Height", min_value=240, max_value=10000, value=int(APP.screen_h)))
     sw_os, sh_os = _safe_size()
+    st.sidebar.caption("Override screen size: ใช้ขนาดหน้าจอที่กำหนดเองแทนขนาดที่ระบบรายงาน | Width: กำหนดความกว้างหน้าจอ (พิกเซล) | Height: กำหนดความสูงหน้าจอ (พิกเซล)")
     st.sidebar.caption(f"OS reports: {sw_os}×{sh_os}px")
 
     st.sidebar.subheader("🎛 Shaping")
+    st.sidebar.caption("ปรับรูปแบบการตอบสนองของ pointer โดยรวม")
     APP.gain = float(st.sidebar.slider("Gain", 0.5, 2.5, APP.gain, 0.05))
     APP.gamma = float(st.sidebar.slider("Gamma", 0.5, 2.0, APP.gamma, 0.05))
     APP.deadzone = float(st.sidebar.slider("Deadzone", 0.0, 0.1, APP.deadzone, 0.005))
+    st.sidebar.caption("Gain: ปรับความแรงของ pointer | Gamma: ปรับความโค้งของ pointer | Deadzone: กำหนดพื้นที่ที่ pointer จะไม่ขยับ (Deadzone)")
 
     st.sidebar.subheader("🪞 Mirror / Invert")
+    st.sidebar.caption("ตั้งค่าการกลับภาพและกลับทิศทาง pointer")
     APP.mirror = st.sidebar.checkbox("Mirror webcam image", value=APP.mirror)
     APP.invert_x = st.sidebar.checkbox("Invert X (x→1−x)", value=APP.invert_x)
     APP.invert_y = st.sidebar.checkbox("Invert Y (y→1−y)", value=APP.invert_y)
+    st.sidebar.caption("Mirror webcam image: กลับภาพจากกล้องให้เหมือนกระจก | Invert X: กลับทิศทาง pointer แกน X | Invert Y: กลับทิศทาง pointer แกน Y")
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("Optional: Degrees")
