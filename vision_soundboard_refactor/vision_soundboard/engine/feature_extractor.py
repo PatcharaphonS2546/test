@@ -1,6 +1,6 @@
-
 from __future__ import annotations
 import math
+import numpy as np
 from typing import Optional
 
 try:
@@ -19,6 +19,8 @@ class FeatureExtractor:
     LEFT_IRIS_IDS  = [468, 469, 470, 471, 472]
     RIGHT_IRIS_IDS = [473, 474, 475, 476, 477]
 
+    _debug_logged = False
+
     def __init__(self, use_mediapipe: bool = True):
         self.use_mediapipe = use_mediapipe and (mp is not None) and (cv2 is not None)
         self.face_landmarks = None
@@ -34,8 +36,8 @@ class FeatureExtractor:
                 static_image_mode=False,
                 refine_landmarks=True,
                 max_num_faces=1,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
+                min_detection_confidence=0.1,
+                min_tracking_confidence=0.1,
             )
             self._initialized = True
 
@@ -44,28 +46,50 @@ class FeatureExtractor:
             self.mesh.close()
 
     @staticmethod
-    def _avg_xy(ids, pts):
+    def _median_xy(ids, pts, outlier_thresh=2.5):
+        import numpy as np
         xs = [pts[i][0] for i in ids if i < len(pts)]
         ys = [pts[i][1] for i in ids if i < len(pts)]
-        if not xs or not ys: return None
-        return (sum(xs)/len(xs), sum(ys)/len(ys))
+        if not xs or not ys:
+            return None
+        # Outlier removal using MAD
+        mx, my = np.median(xs), np.median(ys)
+        mad_x = np.median(np.abs(xs - mx)) if xs else 0.0
+        mad_y = np.median(np.abs(ys - my)) if ys else 0.0
+        xs_filt = [x for x in xs if mad_x == 0.0 or abs(x - mx) / (mad_x + 1e-6) < outlier_thresh]
+        ys_filt = [y for y in ys if mad_y == 0.0 or abs(y - my) / (mad_y + 1e-6) < outlier_thresh]
+        if not xs_filt or not ys_filt:
+            return (mx, my)
+        return (float(np.median(xs_filt)), float(np.median(ys_filt)))
 
     @staticmethod
     def _eye_box_metrics(ids, pts):
-        xs = [pts[i][0] for i in ids if i < len(pts)]
-        ys = [pts[i][1] for i in ids if i < len(pts)]
-        if not xs or not ys: return None
-        x0, x1 = min(xs), max(xs); y0, y1 = min(ys), max(ys)
-        w = max(6.0, x1-x0); h = max(2.0, y1-y0)
+        arr = np.array([pts[i][:2] for i in ids if i < len(pts)])
+        if arr.shape[0] == 0:
+            return None
+        xs = arr[:, 0]
+        ys = arr[:, 1]
+        x0, x1 = np.min(xs), np.max(xs)
+        y0, y1 = np.min(ys), np.max(ys)
+        w = max(6.0, x1 - x0)
+        h = max(2.0, y1 - y0)
         ear = h / max(6.0, w)  # eye-aspect ratio
         return (x0, x1, y0, y1, w, h, ear)
 
     @staticmethod
     def _norm_in_box(p, box):
-        if (p is None) or (box is None): return (0.5, 0.5)
+        if (p is None) or (box is None):
+            return (0.5, 0.5)
         x0, x1, y0, y1, w, h, _ = box
-        nx = (p[0]-x0)/w; ny = (p[1]-y0)/h
-        return (min(1.0, max(0.0, nx)), min(1.0, max(0.0, ny)))
+        # Robust scale factor: ไม่ให้ w/h ต่ำเกินไป
+        w = max(w, 6.0)
+        h = max(h, 2.0)
+        nx = (p[0] - x0) / w
+        ny = (p[1] - y0) / h
+        # Clamp ค่าให้อยู่ในช่วง 0-1
+        nx = min(1.0, max(0.0, nx))
+        ny = min(1.0, max(0.0, ny))
+        return (nx, ny)
 
     def extract(self, frame_bgr) -> Optional[dict]:
         def _fallback(q=0.2, open_=False):
@@ -98,15 +122,50 @@ class FeatureExtractor:
         lmk = lm.landmark
         pts = [(p.x * w, p.y * h, p.z) for p in lmk]
 
+        # Quality check: landmark count and confidence
+        if not FeatureExtractor._debug_logged:
+            print(f'[FeatureExtractor] frame shape: {frame_bgr.shape if frame_bgr is not None else None}')
+            print(f'[FeatureExtractor] landmarks detected: {len(lmk)}')
+        if len(lmk) < 468:
+            if not FeatureExtractor._debug_logged:
+                print('[FeatureExtractor] Fallback: Not enough landmarks detected:', len(lmk))
+                print('[FeatureExtractor] แจ้งผู้ใช้: ไม่พบ landmark จากใบหน้า กรุณาตรวจสอบกล้องหรือแสง')
+            FeatureExtractor._debug_logged = True
+            return _fallback(0.05, False)
+        # Check confidence for key points (if available)
+        key_ids = self.LEFT_EYE_IDS + self.RIGHT_EYE_IDS + self.LEFT_IRIS_IDS + self.RIGHT_IRIS_IDS
+        key_conf = []
+        for i in key_ids:
+            if i < len(lmk):
+                p = lmk[i]
+                v = getattr(p, 'visibility', None)
+                if v is None:
+                    v = 1.0
+                key_conf.append(v)
+        # ไม่เช็ค avg_conf เพราะ mediapipe v0.10.x ไม่คืน visibility
+        l_iris = self._median_xy(self.LEFT_IRIS_IDS, pts)
+        r_iris = self._median_xy(self.RIGHT_IRIS_IDS, pts)
+        l_box  = self._eye_box_metrics(self.LEFT_EYE_IDS, pts)
+        r_box  = self._eye_box_metrics(self.RIGHT_EYE_IDS, pts)
+        if not FeatureExtractor._debug_logged:
+            print(f'[FeatureExtractor] l_iris: {l_iris}, r_iris: {r_iris}')
+            print(f'[FeatureExtractor] l_box: {l_box}, r_box: {r_box}')
+            FeatureExtractor._debug_logged = True
+
         dx = lmk[263].x - lmk[33].x
         dy = lmk[263].y - lmk[33].y
         yaw = math.degrees(math.atan2(dy, dx))
         pitch = math.degrees(math.atan2(lmk[1].y - lmk[168].y, lmk[1].z - lmk[168].z))
 
-        l_iris = self._avg_xy(self.LEFT_IRIS_IDS, pts)
-        r_iris = self._avg_xy(self.RIGHT_IRIS_IDS, pts)
+        l_iris = self._median_xy(self.LEFT_IRIS_IDS, pts)
+        r_iris = self._median_xy(self.RIGHT_IRIS_IDS, pts)
         l_box  = self._eye_box_metrics(self.LEFT_EYE_IDS, pts)
         r_box  = self._eye_box_metrics(self.RIGHT_EYE_IDS, pts)
+
+        # Quality check: iris and eye box must be valid
+        if (l_iris is None or l_box is None) and (r_iris is None or r_box is None):
+            print('[FeatureExtractor] Fallback: iris or eye box invalid', l_iris, l_box, r_iris, r_box)
+            return _fallback(0.1, False)
 
         l_n = self._norm_in_box(l_iris, l_box) if (l_iris and l_box) else (0.5, 0.5)
         r_n = self._norm_in_box(r_iris, r_box) if (r_iris and r_box) else (0.5, 0.5)
