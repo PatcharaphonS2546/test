@@ -123,9 +123,9 @@ class Processor(VideoProcessorBase):
             frac = max(0.0, min(1.0, elapsed / float(max(1, self.APP.dwell_ms))))
             end_angle = int(360 * frac)
             cv2.ellipse(img, (gx_i, gy_i), (28, 28), 0, 0, end_angle, (0,255,180), 5)
-            cv2.putText(img, f"คาลิเบรตจุดที่ {self.APP.idx+1}/{len(self.APP.targets)}",
+            cv2.putText(img, f"Calibration point: {self.APP.idx+1}/{len(self.APP.targets)}",
                         (24,48), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255,255,255), 3)
-            cv2.putText(img, "กรุณาตั้งหัวตรงและมองจุดเป้าหมาย",
+            cv2.putText(img, "Please center your head and look at the target point",
                         (24,90), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,255), 2)
 
             if frac >= 1.0 and 0 <= self.APP.idx < len(self.APP.targets):
@@ -138,7 +138,7 @@ class Processor(VideoProcessorBase):
                 if self.APP.idx >= len(self.APP.targets):
                     rep = self.engine.calibration_finish()
                     self.APP.calib_overlay = False
-                    txt = ("✅ Calibration สำเร็จ · " f"RMSE={rep.get('rmse_px',0):.0f}px · " f"CV={rep.get('rmse_cv_px',0):.0f}px · " f"U={rep.get('uniformity',0):.2f}")
+                    txt = ("✅ Calibration successful · " f"RMSE={rep.get('rmse_px',0):.0f}px · " f"CV={rep.get('rmse_cv_px',0):.0f}px · " f"U={rep.get('uniformity',0):.2f}")
                     cv2.rectangle(img, (10,10), (10+900, 10+50), (0,0,0), -1)
                     cv2.putText(img, txt, (18,48), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,230,255), 3)
 

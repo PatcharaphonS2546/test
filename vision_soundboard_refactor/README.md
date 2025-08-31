@@ -1,31 +1,109 @@
+# คู่มือการใช้งานโปรเจค Vision Soundboard Refactor
 
-# Vision Mouse (Refactor)
-A modular refactor of the single-file Streamlit/WebRTC demo into a small package that is easier to develop and extend.
+## ภาพรวม
+โปรเจคนี้เป็นระบบ Vision Soundboard ที่รวมฟีเจอร์ด้านเสียง การประมวลผลภาพ การควบคุม UI และการวัดผลต่าง ๆ สำหรับงานวิจัยหรือการทดลองที่เกี่ยวข้องกับการใช้งานเสียงและภาพ
 
-## Quick start
-```bash
+## โครงสร้างโปรเจค
+```
+
+
+# คู่มือการใช้งานโปรเจค Vision Soundboard Refactor (ฉบับละเอียด)
+
+## ภาพรวม
+โปรเจคนี้เป็นระบบ Vision Soundboard ที่ออกแบบมาเพื่อการทดลองและวิจัยด้านการควบคุมเมาส์ด้วยสายตา การประมวลผลภาพ และการตอบสนองด้วยเสียง โดยมีโครงสร้างแบบ modular เพื่อให้ง่ายต่อการพัฒนาและขยายฟีเจอร์
+
+## โครงสร้างโปรเจค
+```
+vision_soundboard_refactor/
+├── app.py                  # สคริปต์หลักสำหรับรันโปรเจค
+├── requirements.txt        # รายการ dependencies ที่ต้องติดตั้ง
+├── vision_soundboard/      # โฟลเดอร์รวมโมดูลหลักทั้งหมด
+│   ├── audio/              # โมดูลสำหรับจัดการเสียง เช่น การเล่นเสียงแบบไม่บล็อก
+│   ├── calibration/        # โมดูลสำหรับสอบเทียบตำแหน่งสายตาและรายงานผล
+│   ├── engine/             # โมดูลสำหรับประมวลผลหลัก เช่น กรองข้อมูล, ควบคุมเมาส์, คำนวณคณิตศาสตร์
+│   ├── metrics/            # โมดูลสำหรับบันทึกและ export ข้อมูลการใช้งาน เช่น CSV, PNG
+│   ├── ui/                 # โมดูลสำหรับ UI เช่น sidebar, CSS, การประมวลผลภาพจากกล้อง
+│   └── utils/              # โมดูลเครื่องมือช่วย เช่น geometry, ขนาดหน้าจอ
+```
+
+### รายละเอียดแต่ละโมดูล
+- **audio/**: จัดการเสียง เช่น เล่นเสียงตอบสนองเมื่อผู้ใช้เลือกหรือกระทำบางอย่าง
+- **calibration/**: ฟีเจอร์สอบเทียบ 9 จุด มี countdown, วงแหวน dwell, และรายงานผล RMSE/CV/Uniformity
+- **engine/**: ฟีเจอร์หลัก เช่น กรองข้อมูลด้วย One-Euro smoothing, auto-gain, mouse control, คำนวณค่าต่าง ๆ
+- **metrics/**: บันทึกข้อมูลการใช้งาน เช่น ตำแหน่งเมาส์, เวลาการ dwell, export เป็น CSV หรือ PNG chart
+- **ui/**: ส่วนติดต่อผู้ใช้ เช่น sidebar สำหรับปรับค่าต่าง ๆ, CSS overlays, การประมวลผลภาพจากกล้องผ่าน WebRTC
+- **utils/**: ฟังก์ชันช่วยเหลือ เช่น geometry, screen size
+
+## ขั้นตอนการติดตั้งและใช้งาน
+
+### 1. เตรียม Python Environment
+แนะนำให้ใช้ Python 3.10 ขึ้นไป เพื่อรองรับ dependencies ทั้งหมด
+สามารถสร้าง virtual environment ด้วย venv หรือ conda เพื่อแยกสภาพแวดล้อมการทำงาน
+
+```cmd
+python -m venv venv
+venv\Scripts\activate
+```
+
+### 2. ติดตั้ง Dependencies
+ติดตั้ง package ที่จำเป็นทั้งหมดจากไฟล์ `requirements.txt` เพื่อให้โปรเจคทำงานได้ครบทุกฟีเจอร์
+
+```cmd
 pip install -r requirements.txt
+```
+
+หากต้องการใช้งานฟีเจอร์กล้องหรือ export PNG chart ต้องติดตั้ง `opencv-python`, `mediapipe` และ `matplotlib` ด้วย
+
+### 3. การรันโปรเจค
+รันโปรเจคหลักด้วยคำสั่ง:
+
+```cmd
+python app.py
+```
+
+หรือหากใช้ Streamlit:
+```cmd
 streamlit run app.py
 ```
-> If `mediapipe` or `opencv-python` are missing, the app will still start in a degraded mode (pointer stays at center).
 
-## Layout
-- `app.py` — Streamlit entry point
-- `vision_mouse/` — package with submodules
-  - `engine/` — filters, feature extractor, gaze engine, mouse control, math, autogain
-  - `metrics/` — metrics recorder + CSV/PNG export
-  - `ui/` — webrtc processor, sidebar controls, CSS overlays
-  - `utils/` — small helpers (screen size, geometry)
-  - `audio/` — non-blocking audio playback
+### 4. การใช้งานเบื้องต้น
+เมื่อรันโปรเจค จะมี UI สำหรับควบคุมและใช้งานฟีเจอร์ต่าง ๆ เช่น
+- การสอบเทียบตำแหน่งสายตา (Calibration)
+- การเล่นเสียงตอบสนอง
+- การบันทึกและ export ข้อมูลการใช้งาน
+- การปรับแต่งค่าต่าง ๆ ผ่าน sidebar
+- การแสดง overlay soundboard แบบ dwell-to-speak
 
-The refactor keeps the original behavior:
-- 9-point calibration with countdown, dwell ring, and report (RMSE/CV/Uniformity)
-- One-Euro smoothing with quality-aware tuning
-- Auto-gain per axis, bias, gamma shaping
-- Pointer-only mouse control (no click)
-- Metrics recording, CSV export, and PNG chart export (matplotlib)
-- Optional Thai 2x3 "gaze soundboard" overlay with dwell-to-speak
+#### ตัวอย่างการใช้งาน
+1. เปิดโปรเจคด้วยคำสั่งด้านบน
+2. เลือกฟีเจอร์ที่ต้องการใช้งานผ่าน UI
+3. หากต้องการ export ข้อมูล ให้เลือกเมนู export ใน sidebar
+4. สามารถปรับแต่งค่าการกรอง, auto-gain, หรือ overlay ได้ตามต้องการ
 
-## Notes
-- WebRTC works only in a real browser session (localhost). If the camera preview doesn't show, confirm browser permissions and install `opencv-python` and `mediapipe`.
-- PNG export requires `matplotlib`.
+## การแก้ไขปัญหา (Troubleshooting)
+- หากติดตั้ง dependencies ไม่ครบ ให้ตรวจสอบและติดตั้งตาม requirements.txt
+- หากกล้องไม่แสดงผลในเบราว์เซอร์ ให้ตรวจสอบสิทธิ์การใช้งานกล้อง และติดตั้ง `opencv-python`, `mediapipe`
+- หาก export PNG ไม่ได้ ให้ติดตั้ง `matplotlib`
+- หาก import module ไม่สำเร็จ ให้ตรวจสอบโครงสร้างโฟลเดอร์และไฟล์
+- หากพบ error อื่น ๆ ให้ดูข้อความ error ใน terminal และค้นหาวิธีแก้ไขจากเอกสารหรือ community
+
+## การพัฒนาเพิ่มเติม
+- สามารถเพิ่มหรือแก้ไข module ในโฟลเดอร์ `vision_soundboard/` ได้ตามต้องการ
+- หากต้องการเพิ่ม dependency ใหม่ ให้เพิ่มชื่อ package ใน `requirements.txt` แล้วติดตั้งด้วยคำสั่ง `pip install -r requirements.txt`
+- สามารถปรับแต่ง UI, ฟีเจอร์การประมวลผล, หรือระบบเสียงได้โดยแก้ไขไฟล์ในแต่ละ module
+
+## ติดต่อ
+หากมีข้อสงสัยหรือพบปัญหาในการใช้งาน สามารถติดต่อผู้พัฒนาได้ที่อีเมลหรือช่องทางที่ระบุในโปรเจค
+
+# รายละเอียดฟีเจอร์หลัก
+การปรับโครงสร้างใหม่ (Refactor) ยังคงฟีเจอร์เดิมไว้ เช่น
+- การสอบเทียบ 9 จุด พร้อม countdown, วงแหวน dwell, และรายงาน (RMSE/CV/Uniformity)
+- การกรองข้อมูลด้วย One-Euro smoothing ที่ปรับตามคุณภาพ
+- Auto-gain ต่อแกน, bias, gamma shaping
+- ควบคุมเมาส์แบบ pointer-only (ไม่มีคลิก)
+- บันทึก metrics, export CSV และ PNG chart (matplotlib)
+- มี overlay "gaze soundboard" แบบไทย 2x3 พร้อม dwell-to-speak (เลือกเปิดได้)
+
+# หมายเหตุ
+- WebRTC ใช้งานได้เฉพาะในเบราว์เซอร์จริง (localhost) หากกล้องไม่แสดงผล ให้ตรวจสอบสิทธิ์เบราว์เซอร์และติดตั้ง `opencv-python` กับ `mediapipe`
+- การ export PNG ต้องติดตั้ง `matplotlib`
