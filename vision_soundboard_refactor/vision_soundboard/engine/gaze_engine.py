@@ -44,11 +44,56 @@ class GazeEngine:
         self.sess = Session()
 
     def set_comp_params(self, k_yaw, c_yaw, k_pitch, c_pitch):
-        self.k_yaw = float(k_yaw); self.c_yaw = float(c_yaw) if c_yaw > 1 else float(c_yaw)*100
-        self.k_pitch = float(k_pitch); self.c_pitch = float(c_pitch) if c_pitch > 1 else float(c_pitch)*100
+        """Set compensation parameters for head pose."""
+        self.k_yaw = float(k_yaw)
+        self.c_yaw = float(c_yaw)
+        self.k_pitch = float(k_pitch)
+        self.c_pitch = float(c_pitch)
 
-    def set_bias(self, bx, by):
-        self.bias_x = float(bx); self.bias_y = float(by)
+    def set_bias(self, bias_x, bias_y):
+        """Set bias for gaze mapping."""
+        self.bias_x = float(bias_x)
+        self.bias_y = float(bias_y)
+
+    def set_gain(self, gain):
+        """Set gain for gaze mapping."""
+        self.gain = float(gain)
+
+    def set_smoothing(self, mincutoff=None, beta=None, dcutoff=None):
+        """Set smoothing filter parameters for gaze point."""
+        if mincutoff is not None:
+            self.sess.smooth_x.mincutoff = float(mincutoff)
+            self.sess.smooth_y.mincutoff = float(mincutoff)
+        if beta is not None:
+            self.sess.smooth_x.beta = float(beta)
+            self.sess.smooth_y.beta = float(beta)
+        if dcutoff is not None:
+            self.sess.smooth_x.dcutoff = float(dcutoff)
+            self.sess.smooth_y.dcutoff = float(dcutoff)
+
+    def set_deadzone(self, deadzone):
+        """Set deadzone for gaze point to reduce jitter."""
+        self.deadzone = float(deadzone)
+
+    def calibration_finish(self, features, targets, qualities=None):
+        """Fit affine mapping with optional weights (qualities)."""
+        Xa = np.array(features, dtype=np.float32)
+        Ya = np.array(targets, dtype=np.float32)
+        if qualities is not None:
+            W = np.diag(np.clip(np.array(qualities, dtype=np.float32), 0.01, 1.0))
+            Xa = W @ Xa
+            Ya = W @ Ya
+        lam_xy = 1e-3
+        Ak = np.linalg.solve(Xa.T @ Xa + lam_xy * np.eye(Xa.shape[1], dtype=np.float32), Xa.T @ Ya)
+        self.sess.affine = Ak
+        self.sess.model_ready = True
+        W = np.diag(np.clip(np.array(qualities, dtype=np.float32), 0.01, 1.0))
+        Xa = W @ Xa
+        Ya = W @ Ya
+        lam_xy = 1e-3
+        Ak = np.linalg.solve(Xa.T @ Xa + lam_xy * np.eye(Xa.shape[1], dtype=np.float32), Xa.T @ Ya)
+        self.sess.affine = Ak
+        self.sess.model_ready = True
 
     def reset_auto_gains(self):
         self.auto_x.reset(); self.auto_y.reset()
@@ -127,7 +172,17 @@ class GazeEngine:
         self.sess.last_feat = fv
         self.sess.last_quality = q
         pred = self._map(fv)
-        x, y = self._shape(float(pred[0]), float(pred[1]), q)
+        x, y = float(pred[0]), float(pred[1])
+        # Outlier detection: ถ้าค่า gaze point กระโดดผิดปกติ ให้ smooth หรือ ignore
+        if hasattr(self, '_last_xy'):
+            dx = abs(x - self._last_xy[0])
+            dy = abs(y - self._last_xy[1])
+            if dx > 0.5 or dy > 0.5:
+                # กระโดดผิดปกติ ให้ใช้ค่าเดิมหรือ smooth
+                x = 0.8 * self._last_xy[0] + 0.2 * x
+                y = 0.8 * self._last_xy[1] + 0.2 * y
+        self._last_xy = (x, y)
+        x, y = self._shape(x, y, q)
         t1 = time.time()
         if self.sess.t_prev is not None:
             dt = t1 - self.sess.t_prev
@@ -151,64 +206,6 @@ class GazeEngine:
         self.sess.calib_features.append(fv)
         self.sess.calib_targets.append([float(sx), float(sy)])
         return True
-
-    def calibration_finish(self):
-        X = np.asarray(self.sess.calib_features, dtype=np.float32)
-        Y = np.asarray(self.sess.calib_targets, dtype=np.float32)
-        n = len(X)
-        if n < 5:
-            self.sess.model_ready = False
-            self.sess.affine = None
-            self.sess.report = None
-            return {"ok": False, "msg": "Need at least 5 points"}
-
-        W = np.ones((n, 1), dtype=np.float32)
-        X_aug = np.hstack([X, np.ones((n, 1), dtype=np.float32)])
-        lam_xy, lam_pose, lam_bias = 1e-3, 5e-2, 1e-6
-        R = np.diag([lam_xy, lam_xy, lam_pose, lam_pose, lam_bias]).astype(np.float32)
-        A = np.linalg.solve(X_aug.T @ (W * X_aug) + R, X_aug.T @ (W * Y))
-        self.sess.affine = A
-        self.sess.model_ready = True
-
-        Yp = X_aug @ A
-        dx = (Yp[:, 0] - Y[:, 0]) * self.sw
-        dy = (Yp[:, 1] - Y[:, 1]) * self.sh
-        rmse_train_px = float(np.sqrt(np.mean(dx*dx + dy*dy)))
-
-        K = min(5, n)
-        idx = np.arange(n)
-        rmses = []
-        for k in range(K):
-            test = (idx % K) == k
-            train = ~test
-            Xa, Ya = X_aug[train], Y[train]
-            Xb, Yb = X_aug[test],  Y[test]
-            if len(Xa) < 5 or len(Xb) == 0:
-                continue
-            Ak = np.linalg.solve(Xa.T @ Xa + lam_xy * np.eye(5, dtype=np.float32),
-                                 Xa.T @ Ya)
-            Ybk = Xb @ Ak
-            dx = (Ybk[:, 0] - Yb[:, 0]) * self.sw
-            dy = (Ybk[:, 1] - Yb[:, 1]) * self.sh
-            rmses.append(np.sqrt(np.mean(dx*dx + dy*dy)))
-        rmse_cv_px = float(np.mean(rmses)) if rmses else rmse_train_px
-
-        from collections import defaultdict
-        buckets = defaultdict(list)
-        for (sx, sy), (px, py) in zip(Y.tolist(), (Yp).tolist()):
-            err = math.hypot((px - sx)*self.sw, (py - sy)*self.sh)
-            buckets[(round(sx,3), round(sy,3))].append(err)
-        per_point_rmse = []
-        for v in buckets.values():
-            per_point_rmse.append(np.sqrt(np.mean(np.square(v))))
-        uniformity = float(np.mean(per_point_rmse) / max(1e-6, rmse_train_px)) if per_point_rmse else 1.0
-
-        self.sess.report = CalibrationReport(
-            n_points=n, rmse_px=rmse_train_px, rmse_cv_px=rmse_cv_px,
-            uniformity=uniformity, width=self.sw, height=self.sh
-        )
-        return {"ok": True, "n": n, "rmse_px": rmse_train_px,
-                "rmse_cv_px": rmse_cv_px, "uniformity": uniformity}
 
     def get_report(self):
         rep = self.sess.report

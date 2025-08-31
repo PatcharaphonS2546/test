@@ -11,6 +11,27 @@ class OneEuroFilter:
         self.dx_prev = 0.0
         self.t_prev = None
 
+    def set_params(self, mincutoff=None, beta=None, dcutoff=None):
+        """Set filter parameters for OneEuroFilter."""
+        if mincutoff is not None:
+            self.mincutoff = float(mincutoff)
+        if beta is not None:
+            self.beta = float(beta)
+        if dcutoff is not None:
+            self.dcutoff = float(dcutoff)
+
+    def set_dynamic_params(self, quality):
+        """Dynamically adjust filter parameters based on frame quality."""
+        # ตัวอย่าง logic: quality ต่ำ -> หนืดขึ้น, quality สูง -> ตอบสนองเร็วขึ้น
+        self.mincutoff = max(0.3, 1.6 - 1.2 * quality)
+        self.beta = 0.01 + 0.12 * (1.0 - quality)
+
+    def reset(self, x=None):
+        """Reset filter state. Optionally set initial value x."""
+        self.x_prev = x
+        self.dx_prev = 0.0
+        self.t_prev = None
+
     def _alpha(self, cutoff):
         te = 1.0 / max(1e-6, self.freq)
         tau = 1.0 / (2 * math.pi * cutoff)

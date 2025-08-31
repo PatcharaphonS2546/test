@@ -59,20 +59,29 @@ class Processor(VideoProcessorBase):
         self.engine.gamma = float(self.APP.gamma)
         self.engine.deadzone = float(self.APP.deadzone)
 
+        quality = 1.0  # default quality
         if self.APP.mode == "Webcam/MediaPipe":
             try:
                 x, y = self.engine.process_frame(img, self.engine.ext)
                 x = max(0.0, min(1.0, x))
                 y = max(0.0, min(1.0, y))
+                # ดึงคุณภาพจาก engine ถ้ามี
+                if hasattr(self.engine, "sess") and hasattr(self.engine.sess, "last_quality"):
+                    quality = float(self.engine.sess.last_quality)
             except Exception:
                 x, y = 0.5, 0.5
+                quality = 0.0
         else:
             x, y = self.APP.gx, self.APP.gy
+            quality = 1.0
 
         if self.APP.invert_x: x = 1.0 - x
         if self.APP.invert_y: y = 1.0 - y
 
-        self.APP.gx, self.APP.gy = float(x), float(y)
+        # ใช้ update_gaze และเก็บ history
+        self.APP.update_gaze(x, y, quality)
+        self.APP.add_gaze_history(x, y)
+
         m = self.engine.get_last_metrics()
         self.APP.ui_fps = float(m.get("fps", 0.0)); self.APP.ui_lat = float(m.get("latency_ms", 0.0))
 
