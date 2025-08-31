@@ -48,19 +48,18 @@ class FeatureExtractor:
     @staticmethod
     def _median_xy(ids, pts, outlier_thresh=2.5):
         import numpy as np
-        xs = [pts[i][0] for i in ids if i < len(pts)]
-        ys = [pts[i][1] for i in ids if i < len(pts)]
-        if not xs or not ys:
+        arr = np.array([pts[i][:2] for i in ids if i < len(pts)])
+        if arr.shape[0] == 0:
             return None
-        # Outlier removal using MAD
-        mx, my = np.median(xs), np.median(ys)
-        mad_x = np.median(np.abs(xs - mx)) if xs else 0.0
-        mad_y = np.median(np.abs(ys - my)) if ys else 0.0
-        xs_filt = [x for x in xs if mad_x == 0.0 or abs(x - mx) / (mad_x + 1e-6) < outlier_thresh]
-        ys_filt = [y for y in ys if mad_y == 0.0 or abs(y - my) / (mad_y + 1e-6) < outlier_thresh]
-        if not xs_filt or not ys_filt:
+        mx, my = np.median(arr[:,0]), np.median(arr[:,1])
+        mad_x = np.median(np.abs(arr[:,0] - mx)) if arr.shape[0] else 0.0
+        mad_y = np.median(np.abs(arr[:,1] - my)) if arr.shape[0] else 0.0
+        mask_x = (mad_x == 0.0) | (np.abs(arr[:,0] - mx) / (mad_x + 1e-6) < outlier_thresh)
+        mask_y = (mad_y == 0.0) | (np.abs(arr[:,1] - my) / (mad_y + 1e-6) < outlier_thresh)
+        arr_filt = arr[mask_x & mask_y]
+        if arr_filt.shape[0] == 0:
             return (mx, my)
-        return (float(np.median(xs_filt)), float(np.median(ys_filt)))
+        return (float(np.median(arr_filt[:,0])), float(np.median(arr_filt[:,1])))
 
     @staticmethod
     def _eye_box_metrics(ids, pts):

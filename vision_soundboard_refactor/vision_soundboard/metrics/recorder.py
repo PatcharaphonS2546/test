@@ -1,8 +1,8 @@
-
 from __future__ import annotations
 import os, time
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
+from numba import njit
 
 import numpy as np
 
@@ -28,33 +28,41 @@ class MetricsRecorder:
     def __init__(self):
         self.samples: list[Sample] = []
         self._maxlen = 120000
+        self._df_cache = None
+        self._df_cache_count = 0
 
     def record(self, *, latency_ms, pred_px, target_px=None, point_id=None):
         ts_ms = time.time() * 1000.0
         if len(self.samples) >= self._maxlen:
             self.samples = self.samples[-self._maxlen//2:]
         self.samples.append(Sample(ts_ms, latency_ms, pred_px, target_px, point_id))
+        self._df_cache = None
+        self._df_cache_count = len(self.samples)
 
     def _df(self):
         if not self.samples or pd is None:
             return None
+        # Use cache if available and sample count unchanged
+        if self._df_cache is not None and self._df_cache_count == len(self.samples):
+            return self._df_cache
         pred_arr = np.array([s.pred_px if s.pred_px is not None else (np.nan, np.nan) for s in self.samples])
         tgt_arr = np.array([s.target_px if s.target_px is not None else (np.nan, np.nan) for s in self.samples])
         err_arr = np.linalg.norm(pred_arr - tgt_arr, axis=1)
         rows = [
-            {
-                "ts_ms": s.ts_ms,
-                "latency_ms": s.latency_ms,
-                "pred_x": None if s.pred_px is None else s.pred_px[0],
-                "pred_y": None if s.pred_px is None else s.pred_px[1],
-                "tgt_x": None if s.target_px is None else s.target_px[0],
-                "tgt_y": None if s.target_px is None else s.target_px[1],
-                "point_id": s.point_id,
-                "err_px": err_arr[i] if not np.isnan(err_arr[i]) else None,
-            }
-            for i, s in enumerate(self.samples)
+            dict(ts_ms=s.ts_ms,
+                 latency_ms=s.latency_ms,
+                 pred_x=s.pred_px[0] if s.pred_px else None,
+                 pred_y=s.pred_px[1] if s.pred_px else None,
+                 tgt_x=s.target_px[0] if s.target_px else None,
+                 tgt_y=s.target_px[1] if s.target_px else None,
+                 point_id=s.point_id,
+                 err_px=err if not np.isnan(err) else None)
+            for s, err in zip(self.samples, err_arr)
         ]
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        self._df_cache = df
+        self._df_cache_count = len(self.samples)
+        return df
 
     def summarize(self):
         if pd is None:
@@ -83,13 +91,26 @@ class MetricsRecorder:
         point_ids = df_t["point_id"].values.astype(int)
         unique_ids = np.unique(point_ids)
         jitter_px, mae_px, rmse_px, n = [], [], [], []
-        for pid in unique_ids:
-            mask = point_ids == pid
-            vals = err_px[mask]
-            jitter_px.append(float(np.std(vals)))
-            mae_px.append(float(np.mean(vals)))
-            rmse_px.append(float(np.sqrt(np.mean(np.square(vals)))))
-            n.append(int(np.sum(mask)))
+        @njit
+        def calc_metrics(point_ids, err_px, unique_ids):
+            jitter_px = []
+            mae_px = []
+            rmse_px = []
+            n = []
+            for pid in unique_ids:
+                mask = point_ids == pid
+                vals = err_px[mask]
+                jitter_px.append(np.std(vals))
+                mae_px.append(np.mean(vals))
+                rmse_px.append(np.sqrt(np.mean(np.square(vals))))
+                n.append(np.sum(mask))
+            return jitter_px, mae_px, rmse_px, n
+
+        jitter_px, mae_px, rmse_px, n = calc_metrics(point_ids, err_px, unique_ids)
+        jitter_px = [float(x) for x in jitter_px]
+        mae_px = [float(x) for x in mae_px]
+        rmse_px = [float(x) for x in rmse_px]
+        n = [int(x) for x in n]
         df_points = pd.DataFrame({
             "point_id": unique_ids,
             "jitter_px": jitter_px,

@@ -20,3 +20,4 @@ pygame>=2.0.0
 mediapipe>=0.10.0,<0.11.0
 opencv-python>=4.5.1,<4.13.0
 numpy>=1.21.0,<2.0.0
+numba>=0.57

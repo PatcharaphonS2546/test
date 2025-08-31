@@ -214,3 +214,82 @@ class GazeEngine:
         return {"model_ready": True,
                 "rmse_px": rep.rmse_px, "rmse_cv_px": rep.rmse_cv_px,
                 "uniformity": rep.uniformity, "points": rep.n_points}
+
+def calibration_finish(self):
+    """Finalize calibration using samples accumulated via calibration_add().
+    Returns a dict with rmse and uniformity for UI overlay.
+    """
+    import numpy as np, math
+    X = np.asarray(self.sess.calib_features, dtype=np.float32) if hasattr(self.sess, "calib_features") else None
+    Y = np.asarray(self.sess.calib_targets, dtype=np.float32) if hasattr(self.sess, "calib_targets") else None
+    if X is None or Y is None or len(X) == 0 or len(Y) == 0 or len(X) != len(Y):
+        self.sess.model_ready = False
+        self.sess.affine = None
+        self.sess.report = None
+        return {"ok": False, "msg": "No calibration samples"}
+    n = len(X)
+    if n < 5:
+        self.sess.model_ready = False
+        self.sess.affine = None
+        self.sess.report = None
+        return {"ok": False, "msg": "Need at least 5 points"}
+
+    X_aug = np.hstack([X, np.ones((n, 1), dtype=np.float32)]).astype(np.float32)
+    Y = Y.astype(np.float32)
+
+    lam = 1e-3
+    I = np.eye(X_aug.shape[1], dtype=np.float32)
+    try:
+        A = np.linalg.solve(X_aug.T @ X_aug + lam * I, X_aug.T @ Y)
+    except Exception:
+        A = np.linalg.pinv(X_aug) @ Y
+
+    self.sess.affine = A
+    self.sess.model_ready = True
+
+    Yp = X_aug @ A
+    dx = (Yp[:, 0] - Y[:, 0]) * self.sw
+    dy = (Yp[:, 1] - Y[:, 1]) * self.sh
+    rmse_train_px = float(np.sqrt(np.mean(dx * dx + dy * dy)))
+
+    K = min(5, n) if n >= 5 else n
+    if K < 2:
+        rmse_cv_px = rmse_train_px
+    else:
+        idx = np.arange(n)
+        rmses = []
+        for k in range(K):
+            test = (idx % K) == k
+            train = ~test
+            Xa, Ya = X_aug[train], Y[train]
+            Xb, Yb = X_aug[test],  Y[test]
+            try:
+                Ak = np.linalg.solve(Xa.T @ Xa + lam * I, Xa.T @ Ya)
+            except Exception:
+                Ak = np.linalg.pinv(Xa) @ Ya
+            Ybk = Xb @ Ak
+            dx = (Ybk[:, 0] - Yb[:, 0]) * self.sw
+            dy = (Ybk[:, 1] - Yb[:, 1]) * self.sh
+            rmses.append(float(np.sqrt(np.mean(dx * dx + dy * dy))))
+        rmse_cv_px = float(np.mean(rmses)) if rmses else rmse_train_px
+
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for (sx, sy), (px, py) in zip(Y.tolist(), (Yp).tolist()):
+        err = math.hypot((px - sx) * self.sw, (py - sy) * self.sh)
+        buckets[(round(sx, 3), round(sy, 3))].append(err)
+    if buckets:
+        per_point_rmse = [float(np.sqrt(np.mean(np.square(v)))) for v in buckets.values()]
+        uniformity = float(np.mean(per_point_rmse) / max(1e-6, rmse_train_px))
+    else:
+        uniformity = 1.0
+
+    self.sess.report = {
+        "n_points": n,
+        "rmse_px": rmse_train_px,
+        "rmse_cv_px": rmse_cv_px,
+        "uniformity": uniformity,
+        "width": self.sw,
+        "height": self.sh,
+    }
+    return {"ok": True, "n": n, "rmse_px": rmse_train_px, "rmse_cv_px": rmse_cv_px, "uniformity": uniformity}

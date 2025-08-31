@@ -146,10 +146,15 @@ class Processor(VideoProcessorBase):
                 self.APP.idx += 1; self.calib_hold_start = None; self.pool = []
                 if self.APP.idx >= len(self.APP.targets):
                     rep = self.engine.calibration_finish()
+                    # Reset calibration state after finish
                     self.APP.calib_overlay = False
+                    self.APP.idx = 0
+                    self.pool = []
+                    self.calib_hold_start = None
                     txt = ("✅ Calibration successful · " f"RMSE={rep.get('rmse_px',0):.0f}px · " f"CV={rep.get('rmse_cv_px',0):.0f}px · " f"U={rep.get('uniformity',0):.2f}")
                     cv2.rectangle(img, (10,10), (10+900, 10+50), (0,0,0), -1)
                     cv2.putText(img, txt, (18,48), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,230,255), 3)
+                    return VideoFrame.from_ndarray(img, format="bgr24")
 
         # Mouse pointer only
         self.mouse.set_enable(self.APP.mouse_enabled)
@@ -169,58 +174,54 @@ class Processor(VideoProcessorBase):
             rows, cols = 2, 3
             H, W = img.shape[:2]
             hover_idx = None
-            for r in range(rows):
-                for c in range(cols):
-                    idx = r*cols + c
-                    x0, x1 = c/cols, (c+1)/cols
-                    y0, y1 = r/rows, (r+1)/rows
-                    pt1 = (int(x0*W), int(y0*H))
-                    pt2 = (int(x1*W), int(y1*H))
-                    inside = inside_rect(self.APP.gx, self.APP.gy, (x0, y0, x1, y1))
-                    # กำหนดสีปุ่มจาก self.APP.sound_colors ถ้ามี
-                    if hasattr(self.APP, "sound_colors") and idx < len(self.APP.sound_colors):
-                        base_color = self.APP.sound_colors[idx]
-                    else:
-                        base_color = (40, 40, 40)
-                    color = base_color; thick = 2
-                    if inside:
-                        color = (0, 200, 255); thick = 4
-                        hover_idx = idx
-                    x0_px, y0_px = int(x0*W), int(y0*H)
-                    x1_px, y1_px = int(x1*W), int(y1*H)
-                    # สีพื้นปุ่ม (ใช้ base_color) ก่อน
-                    cv2.rectangle(img, (x0_px, y0_px), (x1_px, y1_px), base_color, -1)
-                    # วาดกรอบปุ่ม (color/thick) หลังสุด
-                    cv2.rectangle(img, pt1, pt2, color, thick)
-                    icon_path = self.APP.sound_icons[idx] if idx < len(self.APP.sound_icons) else None
-                    icon_w, icon_h = int((x1-x0)*W*0.7), int((y1-y0)*H*0.7)
-                    cx = int((x0 + x1)/2 * W) - icon_w//2
-                    cy = int((y0 + y1)/2 * H) - icon_h//2
-                    cx = max(0, min(cx, W-icon_w))
-                    cy = max(0, min(cy, H-icon_h))
-                    cache_key = f"{icon_path}_{icon_w}_{icon_h}"
-                    icon = self._icon_cache.get(cache_key, None)
-                    if icon is None and icon_path and cv2 is not None:
-                        raw_icon = cv2.imread(icon_path, cv2.IMREAD_UNCHANGED)
-                        if raw_icon is not None:
-                            icon = cv2.resize(raw_icon, (icon_w, icon_h))
-                            self._icon_cache[cache_key] = icon
-                    if icon is not None:
-                        if cy+icon_h <= img.shape[0] and cx+icon_w <= img.shape[1]:
-                            if icon.shape[2] == 4:
-                                alpha = icon[:,:,3] / 255.0
-                                for c in range(3):
-                                    img[cy:cy+icon_h, cx:cx+icon_w, c] = (
-                                        alpha * icon[:,:,c] + (1-alpha) * img[cy:cy+icon_h, cx:cx+icon_w, c]
-                                    )
-                            else:
-                                img[cy:cy+icon_h, cx:cx+icon_w] = icon
-                    else:
-                        label = self.APP.sound_labels[idx] if idx < len(self.APP.sound_labels) else f"Button {idx+1}"
-                        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
-                        tx = int((x0 + x1)/2 * W) - tw//2
-                        ty = int((y0 + y1)/2 * H) + th//3
-                        cv2.putText(img, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 3, cv2.LINE_AA)
+            from itertools import product
+            button_info = [
+                (r, c, r*cols + c,
+                 c/cols, (c+1)/cols,
+                 r/rows, (r+1)/rows)
+                for r, c in product(range(rows), range(cols))
+            ]
+            for r, c, idx, x0, x1, y0, y1 in button_info:
+                pt1 = (int(x0*W), int(y0*H))
+                pt2 = (int(x1*W), int(y1*H))
+                inside = inside_rect(self.APP.gx, self.APP.gy, (x0, y0, x1, y1))
+                base_color = self.APP.sound_colors[idx] if hasattr(self.APP, "sound_colors") and idx < len(self.APP.sound_colors) else (40, 40, 40)
+                color, thick = ((0, 200, 255), 4) if inside else (base_color, 2)
+                if inside:
+                    hover_idx = idx
+                x0_px, y0_px = int(x0*W), int(y0*H)
+                x1_px, y1_px = int(x1*W), int(y1*H)
+                cv2.rectangle(img, (x0_px, y0_px), (x1_px, y1_px), base_color, -1)
+                cv2.rectangle(img, pt1, pt2, color, thick)
+                icon_path = self.APP.sound_icons[idx] if idx < len(self.APP.sound_icons) else None
+                icon_w, icon_h = int((x1-x0)*W*0.7), int((y1-y0)*H*0.7)
+                cx = int((x0 + x1)/2 * W) - icon_w//2
+                cy = int((y0 + y1)/2 * H) - icon_h//2
+                cx = max(0, min(cx, W-icon_w))
+                cy = max(0, min(cy, H-icon_h))
+                cache_key = f"{icon_path}_{icon_w}_{icon_h}"
+                icon = self._icon_cache.get(cache_key, None)
+                if icon is None and icon_path and cv2 is not None:
+                    raw_icon = cv2.imread(icon_path, cv2.IMREAD_UNCHANGED)
+                    if raw_icon is not None:
+                        icon = cv2.resize(raw_icon, (icon_w, icon_h))
+                        self._icon_cache[cache_key] = icon
+                if icon is not None:
+                    if cy+icon_h <= img.shape[0] and cx+icon_w <= img.shape[1]:
+                        if icon.shape[2] == 4:
+                            alpha = icon[:,:,3] / 255.0
+                            for cc in range(3):
+                                img[cy:cy+icon_h, cx:cx+icon_w, cc] = (
+                                    alpha * icon[:,:,cc] + (1-alpha) * img[cy:cy+icon_h, cx:cx+icon_w, cc]
+                                )
+                        else:
+                            img[cy:cy+icon_h, cx:cx+icon_w] = icon
+                else:
+                    label = self.APP.sound_labels[idx] if idx < len(self.APP.sound_labels) else f"Button {idx+1}"
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
+                    tx = int((x0 + x1)/2 * W) - tw//2
+                    ty = int((y0 + y1)/2 * H) + th//3
+                    cv2.putText(img, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 3, cv2.LINE_AA)
 
             now = time.time()
             if hover_idx is None:

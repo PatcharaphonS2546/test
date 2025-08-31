@@ -10,28 +10,31 @@ def sidebar(app: AppState):
     # calib_qualities
     if hasattr(app, 'calib_qualities'):
         st.sidebar.write("Calibration Qualities:")
-        for i, q in enumerate(app.calib_qualities):
-            new_q = st.sidebar.slider(f"Quality {i+1}", 0.0, 1.0, q, 0.01, key=f"calib_q_{i}")
-            app.calib_qualities[i] = new_q
+        app.calib_qualities = [
+            st.sidebar.slider(f"Quality {i+1}", 0.0, 1.0, q, 0.01, key=f"calib_q_{i}")
+            for i, q in enumerate(app.calib_qualities)
+        ]
     # gaze_history
     if hasattr(app, 'gaze_history'):
         st.sidebar.write("Gaze History (last 5):")
-        for pt in app.gaze_history[-5:]:
-            st.sidebar.text(f"({pt[0]:.3f}, {pt[1]:.3f})")
+        [st.sidebar.text(f"({pt[0]:.3f}, {pt[1]:.3f})") for pt in app.gaze_history[-5:]]
     # targets
     if hasattr(app, 'targets'):
         st.sidebar.write("Calibration Targets:")
-        for i, t in enumerate(app.targets):
-            col1, col2 = st.sidebar.columns(2)
-            new_x = col1.number_input(f"Target X {i+1}", 0.0, 1.0, t[0], 0.01, key=f"target_x_{i}")
-            new_y = col2.number_input(f"Target Y {i+1}", 0.0, 1.0, t[1], 0.01, key=f"target_y_{i}")
-            app.targets[i] = (new_x, new_y)
+        cols = st.sidebar.columns(2)
+        app.targets = [
+            (cols[0].number_input(f"Target X {i+1}", 0.0, 1.0, t[0], 0.01, key=f"target_x_{i}"),
+             cols[1].number_input(f"Target Y {i+1}", 0.0, 1.0, t[1], 0.01, key=f"target_y_{i}"))
+            for i, t in enumerate(app.targets)
+        ]
     # radius_norm
     if hasattr(app, 'radius_norm'):
         app.set_param('radius_norm', st.sidebar.slider("Radius Norm", 0.005, 0.1, app.radius_norm, 0.001))
     # idx
     if hasattr(app, 'idx'):
-        app.set_param('idx', st.sidebar.number_input("Calibration Index", 0, len(app.targets)-1 if hasattr(app, 'targets') else 0, app.idx))
+        max_idx = len(app.targets)-1 if hasattr(app, 'targets') and len(app.targets) > 0 else 0
+        safe_idx = min(app.idx, max_idx)
+        app.set_param('idx', st.sidebar.number_input("Calibration Index", 0, max_idx, safe_idx))
     # countdown_active
     if hasattr(app, 'countdown_active'):
         app.set_param('countdown_active', st.sidebar.checkbox("Countdown Active", value=app.countdown_active))
@@ -67,26 +70,37 @@ def sidebar(app: AppState):
     # sound_labels
     if hasattr(app, 'sound_labels'):
         st.sidebar.write("Soundboard Labels:")
-        for i, lbl in enumerate(app.sound_labels):
-            app.sound_labels[i] = st.sidebar.text_input(f"Label {i+1}", lbl, key=f"sb_lbl2_{i}")
+        sound_labels = [
+            st.sidebar.text_input(f"Label {i+1}", lbl, key=f"sb_lbl2_{i}")
+            for i, lbl in enumerate(app.sound_labels)
+        ]
+        app.set_param('sound_labels', sound_labels)
     # sound_files
     if hasattr(app, 'sound_files'):
         st.sidebar.write("Soundboard Files:")
-        for i, f in enumerate(app.sound_files):
-            app.sound_files[i] = st.sidebar.text_input(f"File {i+1}", f, key=f"sb_file2_{i}")
+        sound_files = [
+            st.sidebar.text_input(f"File {i+1}", f, key=f"sb_file2_{i}")
+            for i, f in enumerate(app.sound_files)
+        ]
+        app.set_param('sound_files', sound_files)
     # sound_icons
     if hasattr(app, 'sound_icons'):
         st.sidebar.write("Soundboard Icons:")
-        for i, ic in enumerate(app.sound_icons):
-            app.sound_icons[i] = st.sidebar.text_input(f"Icon {i+1}", ic, key=f"sb_icon_{i}")
+        sound_icons = [
+            st.sidebar.text_input(f"Icon {i+1}", ic, key=f"sb_icon_{i}")
+            for i, ic in enumerate(app.sound_icons)
+        ]
+        app.set_param('sound_icons', sound_icons)
     # sound_colors
     if hasattr(app, 'sound_colors'):
         st.sidebar.write("Soundboard Colors:")
-        for i, col in enumerate(app.sound_colors):
-            r = st.sidebar.number_input(f"Color R {i+1}", 0, 255, col[0], key=f"sb_col_r_{i}")
-            g = st.sidebar.number_input(f"Color G {i+1}", 0, 255, col[1], key=f"sb_col_g_{i}")
-            b = st.sidebar.number_input(f"Color B {i+1}", 0, 255, col[2], key=f"sb_col_b_{i}")
-            app.sound_colors[i] = (r, g, b)
+        sound_colors = [
+            (st.sidebar.number_input(f"Color R {i+1}", 0, 255, col[0], key=f"sb_col_r_{i}"),
+             st.sidebar.number_input(f"Color G {i+1}", 0, 255, col[1], key=f"sb_col_g_{i}"),
+             st.sidebar.number_input(f"Color B {i+1}", 0, 255, col[2], key=f"sb_col_b_{i}"))
+            for i, col in enumerate(app.sound_colors)
+        ]
+        app.set_param('sound_colors', sound_colors)
     # _sound_current_idx
     if hasattr(app, '_sound_current_idx'):
         app.set_param('_sound_current_idx', st.sidebar.number_input("Current Soundboard Index", min_value=-1, max_value=5, value=app._sound_current_idx if app._sound_current_idx is not None else -1))
@@ -96,8 +110,10 @@ def sidebar(app: AppState):
     # _sound_last_play
     if hasattr(app, '_sound_last_play'):
         st.sidebar.write("Soundboard Last Play Times:")
-        for i, t in enumerate(app._sound_last_play):
-            app._sound_last_play[i] = st.sidebar.number_input(f"Last Play {i+1}", value=t, key=f"sb_lastplay_{i}")
+        app._sound_last_play = [
+            st.sidebar.number_input(f"Last Play {i+1}", value=t, key=f"sb_lastplay_{i}")
+            for i, t in enumerate(app._sound_last_play)
+        ]
     st.sidebar.subheader("🎯 Compensation (yaw/pitch)")
     st.sidebar.caption("ปรับค่าชดเชยการหมุนศีรษะ (yaw/pitch)")
     app.set_param('k_yaw', float(st.sidebar.slider("k_yaw",   0.0, 1.0, app.k_yaw,   0.01)))
@@ -152,10 +168,8 @@ def sidebar(app: AppState):
     app.set_param('soundboard_on', st.sidebar.toggle("Enable gaze soundboard overlay", value=app.soundboard_on))
     app.set_param('sound_dwell_ms', int(st.sidebar.slider("Dwell to speak (ms)", 1000, 5000, app.sound_dwell_ms, 250)))
     app.set_param('sound_cooldown_ms', int(st.sidebar.slider("Cooldown (ms)", 500, 5000, app.sound_cooldown_ms, 250)))
-    for i in range(6):
-        c1, c2 = st.sidebar.columns([1,2])
-        app.sound_labels[i] = c1.text_input(f"Label {i+1}", app.sound_labels[i], key=f"sb_lbl_{i}")
-        app.sound_files[i] = c2.text_input(f"File {i+1}", app.sound_files[i], key=f"sb_file_{i}")
+    # อัปเดต sound_labels/sound_files ผ่าน set_param ด้านบนแล้ว ไม่ต้องอัปเดตซ้ำ
+    # หากต้องการให้แก้ไขเฉพาะ index ให้ใช้ set_param หลัง loop
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧭 Calibration (9 points)")
